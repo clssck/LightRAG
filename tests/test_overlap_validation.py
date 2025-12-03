@@ -5,9 +5,12 @@ This test validates the fix for the bug where overlap_tokens >= max_tokens
 causes an infinite loop in the chunking function.
 """
 
+import pytest
+
 from lightrag.rerank import chunk_documents_for_rerank
 
 
+@pytest.mark.offline
 class TestOverlapValidation:
     """Test suite for overlap_tokens validation"""
 
@@ -72,7 +75,7 @@ class TestOverlapValidation:
         ]
 
         # overlap_tokens > max_tokens
-        chunked_docs, doc_indices = chunk_documents_for_rerank(
+        chunked_docs, _ = chunk_documents_for_rerank(
             documents, max_tokens=25, overlap_tokens=30
         )
 

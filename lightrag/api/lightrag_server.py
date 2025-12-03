@@ -1039,9 +1039,12 @@ def create_app(args):
                 kwargs["enable_chunking"] = (
                     os.getenv("RERANK_ENABLE_CHUNKING", "false").lower() == "true"
                 )
-                kwargs["max_tokens_per_doc"] = int(
-                    os.getenv("RERANK_MAX_TOKENS_PER_DOC", "4096")
-                )
+                try:
+                    kwargs["max_tokens_per_doc"] = int(
+                        os.getenv("RERANK_MAX_TOKENS_PER_DOC", "4096")
+                    )
+                except ValueError:
+                    kwargs["max_tokens_per_doc"] = 4096
 
             return await selected_rerank_func(**kwargs, extra_body=extra_body)
 
