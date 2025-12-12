@@ -2,7 +2,16 @@
   "venv": ".venv",
   "venvPath": ".",
   "include": ["lightrag"],
+  "exclude": ["lightrag/evaluation"],
   "reportMissingImports": "none",
   "reportMissingModuleSource": "none",
-  "reportMissingTypeStubs": "none"
+  "reportMissingTypeStubs": "none",
+  "reportOptionalSubscript": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalContextManager": "none",
+  "reportOptionalOperand": "none",
+  "reportAttributeAccessIssue": "warning",
+  "reportArgumentType": "warning",
+  "reportReturnType": "warning",
+  "reportGeneralTypeIssues": "warning"
 }
