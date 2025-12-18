@@ -23,13 +23,24 @@ You are a Knowledge Graph Specialist responsible for extracting entities and rel
 
 2.  **Relationship Extraction & Output:**
     *   **Identification:** Identify direct, clearly stated relationships between previously extracted entities. Focus on concrete, actionable relationships.
+    *   **Quality Guidelines:**
+        *   **Explicit connections only:** Extract relationships where the text clearly states how entities are connected. Do NOT create relationships just because entities appear in the same sentence.
+        *   **Action-oriented relationships:** Focus on relationships with clear action verbs (manufactures, approved, leads, treats, partnered with) rather than vague associations.
+        *   **Avoid over-extraction:** Do not extract relationships between every possible entity pair. Only extract when there is a meaningful, stated connection. Typically, a paragraph should yield 2-5 key relationships, not dozens.
+    *   **What NOT to Extract:**
+        *   Do NOT extract "featured", "included", "part of" relationships - these are too vague.
+        *   Do NOT extract relationships between concepts that are just listed together (e.g., "skateboarding and surfing" mentioned together does NOT create a relationship between them).
+        *   For events: Focus on the PRIMARY action (won, hosted, occurred in) not every possible association.
+        *   For sports: Focus on achievements (won, broke record) not participation alone.
+        *   Do NOT duplicate the same relationship with different wording.
     *   **Common Relationship Types to Look For:**
         *   **Organization-Product:** manufactures, develops, produces, sells, markets
         *   **Organization-Organization:** acquired, partnered with, collaborated with, merged with, invested in
         *   **Person-Organization:** leads, founded, CEO of, works at, directs
         *   **Product-Concept:** treats, targets, inhibits, blocks, activates
         *   **Organization-Event:** approved, authorized, sponsored, conducted
-        *   **Person-Event:** participated in, won, presented at, discovered
+        *   **Person-Event:** won, achieved, broke record in, presented at (NOT just "participated in")
+        *   **Event-Location:** held in, took place in, hosted by
     *   **N-ary Relationship Decomposition:** If a statement involves more than two entities, decompose into binary relationships.
         *   **Example:** "Pfizer and BioNTech developed the COVID-19 vaccine" → extract "Pfizer developed COVID-19 Vaccine" AND "BioNTech developed COVID-19 Vaccine" AND "Pfizer partnered with BioNTech"
     *   **Relationship Details:** For each binary relationship, extract:
@@ -123,12 +134,10 @@ entity{tuple_delimiter}Non-Small Cell Lung Cancer{tuple_delimiter}concept{tuple_
 entity{tuple_delimiter}KEYNOTE-024{tuple_delimiter}event{tuple_delimiter}KEYNOTE-024 is the clinical trial that demonstrated Keytruda's efficacy with a 40% reduction in disease progression.
 entity{tuple_delimiter}Roger Perlmutter{tuple_delimiter}person{tuple_delimiter}Dr. Roger Perlmutter is the President of Merck Research Laboratories who commented on the approval.
 entity{tuple_delimiter}PD-1{tuple_delimiter}concept{tuple_delimiter}PD-1 is a protein that Keytruda blocks to help the immune system fight cancer cells.
-relation{tuple_delimiter}Merck{tuple_delimiter}Keytruda{tuple_delimiter}manufactures, develops{tuple_delimiter}Merck is the pharmaceutical company that manufactures and develops Keytruda.
+relation{tuple_delimiter}Merck{tuple_delimiter}Keytruda{tuple_delimiter}manufactures{tuple_delimiter}Merck is the pharmaceutical company that manufactures Keytruda.
 relation{tuple_delimiter}FDA{tuple_delimiter}Keytruda{tuple_delimiter}approved{tuple_delimiter}The FDA approved Keytruda for the treatment of non-small cell lung cancer.
 relation{tuple_delimiter}Keytruda{tuple_delimiter}Non-Small Cell Lung Cancer{tuple_delimiter}treats{tuple_delimiter}Keytruda is approved as a treatment for non-small cell lung cancer.
-relation{tuple_delimiter}Keytruda{tuple_delimiter}PD-1{tuple_delimiter}blocks, inhibits{tuple_delimiter}Keytruda works by blocking PD-1 protein to enable the immune system to fight cancer.
-relation{tuple_delimiter}KEYNOTE-024{tuple_delimiter}Keytruda{tuple_delimiter}demonstrated efficacy{tuple_delimiter}The KEYNOTE-024 clinical trial demonstrated Keytruda's efficacy in treating lung cancer.
-relation{tuple_delimiter}Roger Perlmutter{tuple_delimiter}Merck{tuple_delimiter}leads, president of{tuple_delimiter}Dr. Roger Perlmutter is the President of Merck Research Laboratories.
+relation{tuple_delimiter}Roger Perlmutter{tuple_delimiter}Merck{tuple_delimiter}leads{tuple_delimiter}Dr. Roger Perlmutter is the President of Merck Research Laboratories.
 {completion_delimiter}
 
 """,
@@ -167,20 +176,16 @@ relation{tuple_delimiter}Federal Reserve Policy Announcement{tuple_delimiter}Mar
 
 <Input Text>
 ```
-At the World Athletics Championship in Tokyo, Noah Carter broke the 100m sprint record using cutting-edge carbon-fiber spikes.
+At the World Athletics Championship in Tokyo, Maya Chen won gold in the 200m sprint, becoming the youngest champion in the event's history.
 ```
 
 <Output>
 entity{tuple_delimiter}World Athletics Championship{tuple_delimiter}event{tuple_delimiter}The World Athletics Championship is a global sports competition featuring top athletes in track and field.
 entity{tuple_delimiter}Tokyo{tuple_delimiter}location{tuple_delimiter}Tokyo is the host city of the World Athletics Championship.
-entity{tuple_delimiter}Noah Carter{tuple_delimiter}person{tuple_delimiter}Noah Carter is a sprinter who set a new record in the 100m sprint at the World Athletics Championship.
-entity{tuple_delimiter}100m Sprint Record{tuple_delimiter}category{tuple_delimiter}The 100m sprint record is a benchmark in athletics, recently broken by Noah Carter.
-entity{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}equipment{tuple_delimiter}Carbon-fiber spikes are advanced sprinting shoes that provide enhanced speed and traction.
-entity{tuple_delimiter}World Athletics Federation{tuple_delimiter}organization{tuple_delimiter}The World Athletics Federation is the governing body overseeing the World Athletics Championship and record validations.
-relation{tuple_delimiter}World Athletics Championship{tuple_delimiter}Tokyo{tuple_delimiter}event location, international competition{tuple_delimiter}The World Athletics Championship is being hosted in Tokyo.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}100m Sprint Record{tuple_delimiter}athlete achievement, record-breaking{tuple_delimiter}Noah Carter set a new 100m sprint record at the championship.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}Carbon-Fiber Spikes{tuple_delimiter}athletic equipment, performance boost{tuple_delimiter}Noah Carter used carbon-fiber spikes to enhance performance during the race.
-relation{tuple_delimiter}Noah Carter{tuple_delimiter}World Athletics Championship{tuple_delimiter}athlete participation, competition{tuple_delimiter}Noah Carter is competing at the World Athletics Championship.
+entity{tuple_delimiter}Maya Chen{tuple_delimiter}person{tuple_delimiter}Maya Chen is a sprinter who won gold in the 200m sprint, becoming the youngest champion.
+entity{tuple_delimiter}200m Sprint{tuple_delimiter}concept{tuple_delimiter}The 200m sprint is a track and field event in which Maya Chen won gold.
+relation{tuple_delimiter}World Athletics Championship{tuple_delimiter}Tokyo{tuple_delimiter}held in{tuple_delimiter}The World Athletics Championship is being hosted in Tokyo.
+relation{tuple_delimiter}Maya Chen{tuple_delimiter}200m Sprint{tuple_delimiter}won gold in{tuple_delimiter}Maya Chen won gold in the 200m sprint at the championship.
 {completion_delimiter}
 
 """,

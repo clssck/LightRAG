@@ -402,13 +402,14 @@ class EntityExtractionEvaluator:
         """Run entity extraction using the prompt."""
         from lightrag.prompt import PROMPTS
 
-        # Get the full system prompt
+        # Get the full system prompt - include ALL examples
+        all_examples = "\n".join(PROMPTS.get("entity_extraction_examples", [""]))
         system_prompt = prompt_template.format(
             entity_types='["Person","Organization","Location","Event","Concept","Artifact"]',
             tuple_delimiter="<|#|>",
             completion_delimiter="<|COMPLETE|>",
             language="English",
-            examples=PROMPTS.get("entity_extraction_examples", [""])[0],
+            examples=all_examples,
         )
 
         user_prompt = PROMPTS.get("entity_extraction_user_prompt", "").format(
@@ -426,7 +427,7 @@ class EntityExtractionEvaluator:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.0,
+                temperature=0.2,  # Slightly higher for prompt sensitivity
                 max_tokens=4000,
             )
             output = response.choices[0].message.content or ""
