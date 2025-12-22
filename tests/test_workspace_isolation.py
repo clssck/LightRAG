@@ -774,10 +774,12 @@ relation<|#|>Deep Learning<|#|>Neural Networks<|#|>uses, composed of<|#|>Deep Le
             return mock_llm_func
 
         # Mock embedding function
+        embedding_dim = int(os.environ.get('EMBEDDING_DIM', '1024'))
+
         async def mock_embedding_func(texts: list[str]) -> np.ndarray:
             # Add coroutine switching to simulate async I/O and allow concurrent execution
             await asyncio.sleep(0)
-            return np.random.rand(len(texts), 384)  # 384-dimensional vectors
+            return np.random.rand(len(texts), embedding_dim)  # match configured embedding dimension
 
         # Test 11.1: Create two LightRAG instances with different workspaces
         print('\nTest 11.1: Create two LightRAG instances with different workspaces')
@@ -803,7 +805,7 @@ relation<|#|>Deep Learning<|#|>Neural Networks<|#|>uses, composed of<|#|>Deep Le
             workspace='project_a',
             llm_model_func=mock_llm_func_a,
             embedding_func=EmbeddingFunc(
-                embedding_dim=384,
+                embedding_dim=embedding_dim,
                 max_token_size=8192,
                 func=mock_embedding_func,
             ),
@@ -815,7 +817,7 @@ relation<|#|>Deep Learning<|#|>Neural Networks<|#|>uses, composed of<|#|>Deep Le
             workspace='project_b',
             llm_model_func=mock_llm_func_b,
             embedding_func=EmbeddingFunc(
-                embedding_dim=384,
+                embedding_dim=embedding_dim,
                 max_token_size=8192,
                 func=mock_embedding_func,
             ),
@@ -849,87 +851,47 @@ relation<|#|>Deep Learning<|#|>Neural Networks<|#|>uses, composed of<|#|>Deep Le
         print(f'   Inserted to project_b: {len(text_for_project_b)} chars (concurrent)')
         print(f'   Total concurrent execution time: {elapsed_time:.3f}s')
 
-        # Test 11.3: Verify file structure
-        print('\nTest 11.3: Verify workspace directory structure')
+        # Test 11.3: Verify workspace isolation via storage APIs
+        print('\nTest 11.3: Verify workspace data isolation (storage API)')
 
-        project_a_dir = Path(test_dir) / 'project_a'
-        project_b_dir = Path(test_dir) / 'project_b'
+        from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding
 
-        project_a_exists = project_a_dir.exists()
-        project_b_exists = project_b_dir.exists()
+        doc_id_a = compute_mdhash_id(sanitize_text_for_encoding(text_for_project_a), prefix='doc-')
+        doc_id_b = compute_mdhash_id(sanitize_text_for_encoding(text_for_project_b), prefix='doc-')
 
-        print(f'   project_a directory: {project_a_dir}')
-        print(f'   project_a exists: {project_a_exists}')
-        print(f'   project_b directory: {project_b_dir}')
-        print(f'   project_b exists: {project_b_exists}')
+        doc_a = await rag1.full_docs.get_by_id(doc_id_a)
+        doc_b = await rag2.full_docs.get_by_id(doc_id_b)
 
-        assert project_a_exists, 'project_a directory should exist'
-        assert project_b_exists, 'project_b directory should exist'
+        assert doc_a is not None, 'project_a document should exist in workspace storage'
+        assert doc_b is not None, 'project_b document should exist in workspace storage'
 
-        # List files in each directory
-        print('\n   Files in project_a/:')
-        for file in sorted(project_a_dir.glob('*')):
-            if file.is_file():
-                size = file.stat().st_size
-                print(f'     - {file.name} ({size} bytes)')
+        doc_a_content = doc_a.get('content', '')
+        doc_b_content = doc_b.get('content', '')
 
-        print('\n   Files in project_b/:')
-        for file in sorted(project_b_dir.glob('*')):
-            if file.is_file():
-                size = file.stat().st_size
-                print(f'     - {file.name} ({size} bytes)')
+        # Verify each workspace contains its own text content
+        assert 'Artificial Intelligence' in doc_a_content, "project_a should contain 'Artificial Intelligence'"
+        assert 'Machine Learning' in doc_a_content, "project_a should contain 'Machine Learning'"
+        assert 'Deep Learning' not in doc_a_content, "project_a should NOT contain 'Deep Learning' from project_b"
+        assert 'Neural Networks' not in doc_a_content, "project_a should NOT contain 'Neural Networks' from project_b"
 
-        print('✅ PASSED: LightRAG E2E - File Structure')
-        print('   Workspace directories correctly created and separated')
+        assert 'Deep Learning' in doc_b_content, "project_b should contain 'Deep Learning'"
+        assert 'Neural Networks' in doc_b_content, "project_b should contain 'Neural Networks'"
+        assert 'Artificial Intelligence' not in doc_b_content, (
+            "project_b should NOT contain 'Artificial Intelligence' from project_a"
+        )
+        # Note: "Machine Learning" might appear in project_b's text, so we skip that check
 
-        # Test 11.4: Verify data isolation by checking file contents
-        print('\nTest 11.4: Verify data isolation (check file contents)')
+        # Cross-workspace lookups should not leak data
+        doc_a_in_b = await rag2.full_docs.get_by_id(doc_id_a)
+        doc_b_in_a = await rag1.full_docs.get_by_id(doc_id_b)
 
-        # Check if full_docs storage files exist and contain different content
-        docs_a_file = project_a_dir / 'kv_store_full_docs.json'
-        docs_b_file = project_b_dir / 'kv_store_full_docs.json'
+        assert doc_a_in_b is None, 'project_a document should not be visible in project_b workspace'
+        assert doc_b_in_a is None, 'project_b document should not be visible in project_a workspace'
 
-        if docs_a_file.exists() and docs_b_file.exists():
-            import json
-
-            with open(docs_a_file) as f:
-                docs_a_content = json.load(f)
-
-            with open(docs_b_file) as f:
-                docs_b_content = json.load(f)
-
-            print(f'   project_a doc count: {len(docs_a_content)}')
-            print(f'   project_b doc count: {len(docs_b_content)}')
-
-            # Verify they contain different data
-            assert docs_a_content != docs_b_content, 'Document storage not properly isolated'
-
-            # Verify each workspace contains its own text content
-            docs_a_str = json.dumps(docs_a_content)
-            docs_b_str = json.dumps(docs_b_content)
-
-            # Check project_a contains its text and NOT project_b's text
-            assert 'Artificial Intelligence' in docs_a_str, "project_a should contain 'Artificial Intelligence'"
-            assert 'Machine Learning' in docs_a_str, "project_a should contain 'Machine Learning'"
-            assert 'Deep Learning' not in docs_a_str, "project_a should NOT contain 'Deep Learning' from project_b"
-            assert 'Neural Networks' not in docs_a_str, "project_a should NOT contain 'Neural Networks' from project_b"
-
-            # Check project_b contains its text and NOT project_a's text
-            assert 'Deep Learning' in docs_b_str, "project_b should contain 'Deep Learning'"
-            assert 'Neural Networks' in docs_b_str, "project_b should contain 'Neural Networks'"
-            assert 'Artificial Intelligence' not in docs_b_str, (
-                "project_b should NOT contain 'Artificial Intelligence' from project_a"
-            )
-            # Note: "Machine Learning" might appear in project_b's text, so we skip that check
-
-            print('✅ PASSED: LightRAG E2E - Data Isolation')
-            print('   Document storage correctly isolated between workspaces')
-            print('   project_a contains only its own data')
-            print('   project_b contains only its own data')
-        else:
-            print('   Document storage files not found (may not be created yet)')
-            print('✅ PASSED: LightRAG E2E - Data Isolation')
-            print('   Skipped file content check (files not created)')
+        print('✅ PASSED: LightRAG E2E - Data Isolation')
+        print('   Document storage correctly isolated between workspaces')
+        print('   project_a contains only its own data')
+        print('   project_b contains only its own data')
 
         print('\n   ✓ Test complete - workspace isolation verified at E2E level')
 

@@ -13,7 +13,7 @@ Endpoints:
 
 import mimetypes
 import traceback
-from typing import Annotated, Any, ClassVar
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -24,7 +24,7 @@ from fastapi import (
     Query,
     UploadFile,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.storage.s3_client import S3Client
@@ -48,8 +48,8 @@ class S3ListResponse(BaseModel):
     folders: list[str] = Field(description='Virtual folders (common prefixes)')
     objects: list[S3ObjectInfo] = Field(description='Objects at this level')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'bucket': 'lightrag',
                 'prefix': 'staging/default/',
@@ -64,6 +64,7 @@ class S3ListResponse(BaseModel):
                 ],
             }
         }
+    )
 
 
 class S3DownloadResponse(BaseModel):

@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 
-from lightrag import LightRAG
+from lightrag import LightRAG, create_chunker
 from lightrag import __version__ as core_version
 from lightrag.api import __api_version__
 from lightrag.api.auth import auth_handler
@@ -1001,6 +1001,12 @@ def create_app(args):
 
     # Initialize RAG with unified configuration
     try:
+        # Create chunking function with configured preset (default: semantic)
+        # Config already validates and normalizes the preset value
+        chunking_preset = getattr(args, 'chunking_preset', 'semantic')
+        chunking_func = create_chunker(preset=chunking_preset)
+        logger.info(f'Using chunking preset: {chunking_preset}')
+
         rag = LightRAG(
             working_dir=args.working_dir,
             workspace=args.workspace,
@@ -1011,6 +1017,7 @@ def create_app(args):
             summary_context_size=args.summary_context_size,
             chunk_token_size=int(args.chunk_size),
             chunk_overlap_token_size=int(args.chunk_overlap_size),
+            chunking_func=chunking_func,
             llm_model_kwargs=create_llm_model_kwargs(args.llm_binding, args, llm_timeout),
             embedding_func=embedding_func,
             default_llm_timeout=llm_timeout,

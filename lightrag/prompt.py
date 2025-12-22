@@ -459,6 +459,38 @@ Output:
 """,
 ]
 
+PROMPTS['orphan_connection_validation'] = """---Task---
+Evaluate if a meaningful relationship exists between two entities.
+
+Orphan: {orphan_name} ({orphan_type}) - {orphan_description}
+Candidate: {candidate_name} ({candidate_type}) - {candidate_description}
+Similarity: {similarity_score}
+
+Valid relationship types:
+- direct: One uses/creates/owns the other
+- industry: Both operate in the same sector
+- competitive: Direct competitors or alternatives
+- temporal: Versions, successors, or historical connections
+- dependency: One relies on/runs on the other
+
+Output valid JSON only (no markdown):
+{{"should_connect": bool, "confidence": float, "relationship_type": str|null, "relationship_keywords": str|null, "relationship_description": str|null, "reasoning": str}}
+
+Rules:
+- confidence must be a number between 0.0 and 1.0
+- HIGH confidence (>=0.7) only for direct/explicit relationships
+- MEDIUM confidence (0.4-0.69) for strong implicit/industry relationships
+- LOW confidence (<0.4) for weak/tenuous connections
+- should_connect=true only when confidence >= 0.6
+- Similarity alone is not sufficient; explain the relationship
+
+Example (connected):
+{{"should_connect": true, "confidence": 0.82, "relationship_type": "direct", "relationship_keywords": "framework, built-with", "relationship_description": "Django is a web framework written in Python", "reasoning": "Direct explicit relationship"}}
+
+Example (not connected):
+{{"should_connect": false, "confidence": 0.05, "relationship_type": null, "relationship_keywords": null, "relationship_description": null, "reasoning": "No logical connection"}}
+"""
+
 # HyDE (Hypothetical Document Embedding) prompt
 # Generates a hypothetical answer to improve retrieval through semantic similarity
 PROMPTS['hyde_prompt'] = """You are a knowledgeable assistant. Given the following question, write a brief, factual passage that would directly answer it. Write as if you are certain of the facts, even if you need to imagine plausible details. Focus on being informative and comprehensive.

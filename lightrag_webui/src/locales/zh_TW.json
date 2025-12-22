@@ -102,6 +102,14 @@
       },
       "generalError": "上傳失敗\n{{error}}",
       "fileTypes": "支援的檔案類型：TXT, MD, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "advancedOptions": "進階選項",
+      "chunkingPreset": {
+        "label": "分塊策略",
+        "semantic": "語意分塊（推薦）",
+        "recursive": "遞迴分塊",
+        "basic": "基礎分塊",
+        "description": "文件分塊處理的方式"
+      },
       "fileUploader": {
         "singleFileLimit": "一次只能上傳一個檔案",
         "maxFilesLimit": "最多只能上傳 {{count}} 個檔案",

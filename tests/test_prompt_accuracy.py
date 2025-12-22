@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import pytest
 
 from lightrag.prompt import PROMPTS
 
@@ -100,6 +103,9 @@ RAG_TEST_CASES = [
 
 async def call_llm(prompt: str, model: str = 'gpt-4o-mini') -> str:
     """Call OpenAI API with a single prompt."""
+    if not os.getenv('OPENAI_API_KEY'):
+        pytest.skip('OPENAI_API_KEY not set')
+
     import openai
 
     client = openai.AsyncOpenAI()
@@ -113,6 +119,7 @@ async def call_llm(prompt: str, model: str = 'gpt-4o-mini') -> str:
 
 @dataclass
 class TestResult:
+    __test__ = False
     name: str
     passed: bool
     details: str
@@ -131,7 +138,11 @@ async def test_keywords_extraction() -> list[TestResult]:
     examples = '\n'.join(PROMPTS['keywords_extraction_examples'])
 
     for case in KEYWORD_TEST_QUERIES:
-        prompt = PROMPTS['keywords_extraction'].format(examples=examples, query=case['query'])
+        prompt = PROMPTS['keywords_extraction'].format(
+            examples=examples,
+            query=case['query'],
+            language='English',
+        )
 
         output = await call_llm(prompt)
 

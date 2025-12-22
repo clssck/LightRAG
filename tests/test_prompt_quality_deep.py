@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import pytest
 
 from lightrag.prompt import PROMPTS
 
@@ -366,6 +369,9 @@ ORPHAN_TEST_CASES = [
 
 async def call_llm(prompt: str, model: str = 'gpt-4o-mini') -> str:
     """Call OpenAI API."""
+    if not os.getenv('OPENAI_API_KEY'):
+        pytest.skip('OPENAI_API_KEY not set')
+
     import openai
 
     client = openai.AsyncOpenAI()
@@ -401,6 +407,8 @@ def format_entity_prompt(text: str) -> str:
         + PROMPTS['entity_extraction_user_prompt'].format(
             completion_delimiter=comp_del,
             language='English',
+            entity_types='person, organization, location, concept, product, event, category, method',
+            input_text=text,
         )
     )
 
@@ -530,6 +538,7 @@ async def test_keywords_extraction_deep() -> list[KeywordResult]:
         prompt = PROMPTS['keywords_extraction'].format(
             examples=examples,
             query=data['query'],
+            language='English',
         )
 
         output = await call_llm(prompt)

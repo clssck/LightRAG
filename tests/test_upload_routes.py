@@ -5,31 +5,12 @@ and FastAPI's TestClient pattern with mocked S3Client and LightRAG.
 """
 
 import contextlib
-import sys
 from typing import Annotated, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Mock the config module BEFORE importing to prevent argparse issues
-mock_global_args = MagicMock()
-mock_global_args.token_secret = 'test-secret'
-mock_global_args.jwt_secret_key = 'test-jwt-secret'
-mock_global_args.jwt_algorithm = 'HS256'
-mock_global_args.jwt_expire_hours = 24
-mock_global_args.username = None
-mock_global_args.password = None
-mock_global_args.guest_token = None
-
-mock_config_module = MagicMock()
-mock_config_module.global_args = mock_global_args
-sys.modules['lightrag.api.config'] = mock_config_module
-
-mock_auth_module = MagicMock()
-mock_auth_module.auth_handler = MagicMock()
-sys.modules['lightrag.api.auth'] = mock_auth_module
-
-# Now import FastAPI components
+# Import FastAPI components
 from fastapi import APIRouter, FastAPI, File, Form, HTTPException, UploadFile
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel

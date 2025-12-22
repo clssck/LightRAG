@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import configparser
 import inspect
 import json
 import os
@@ -79,7 +78,7 @@ from lightrag.kg.shared_storage import (
 )
 from lightrag.namespace import NameSpace
 from lightrag.operate import (
-    chunking_by_token_size,
+    create_chunker,
     extract_entities,
     kg_query,
     merge_nodes_and_edges,
@@ -108,14 +107,17 @@ from lightrag.utils import (
     subtract_source_ids,
 )
 
+# Public API exports (for re-export via __init__.py)
+__all__ = [
+    'LightRAG',
+    'QueryParam',
+    'create_chunker',
+]
+
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path='.env', override=False)
-
-# TODO: TO REMOVE @Yannick
-config = configparser.ConfigParser()
-config.read('config.ini', 'utf-8')
 
 
 @final
@@ -252,21 +254,23 @@ class LightRAG:
             int,
         ],
         list[dict[str, Any]] | Awaitable[list[dict[str, Any]]],
-    ] = field(default_factory=lambda: chunking_by_token_size)
+    ] = field(default_factory=lambda: create_chunker(preset='semantic'))
     """
     Custom chunking function for splitting text into chunks before processing.
 
     The function can be either synchronous or asynchronous.
 
+    Defaults to Kreuzberg's 'semantic' preset, which preserves meaning boundaries
+    and is optimal for RAG retrieval quality.
+
     The function should take the following parameters:
 
-        - `tokenizer`: A Tokenizer instance to use for tokenization.
+        - `tokenizer`: A Tokenizer instance (unused by Kreuzberg presets).
         - `content`: The text to be split into chunks.
-        - `split_by_character`: The character to split the text on. If None, the text is split into chunks of `chunk_token_size` tokens.
-        - `split_by_character_only`: If True, the text is split only on the specified character.
+        - `split_by_character`: The character to split on (unused by Kreuzberg presets).
+        - `split_by_character_only`: If True, split only on character (unused by Kreuzberg presets).
         - `chunk_overlap_token_size`: The number of overlapping tokens between consecutive chunks.
         - `chunk_token_size`: The maximum number of tokens per chunk.
-
 
     The function should return a list of dictionaries (or an awaitable that resolves to a list),
     where each dictionary contains the following keys:
@@ -274,7 +278,10 @@ class LightRAG:
         - `content` (str): The text content of the chunk.
         - `chunk_order_index` (int): Zero-based index indicating the chunk's order in the document.
 
-    Defaults to `chunking_by_token_size` if not specified.
+    Available presets:
+        - `create_chunker(preset='semantic')`: Preserves semantic/meaning boundaries (default)
+        - `create_chunker(preset='recursive')`: Splits by paragraphs → sentences → words
+        - `create_chunker(preset=None)`: Basic size-based chunking
     """
 
     # Embedding
@@ -405,10 +412,6 @@ class LightRAG:
 
     # Storages Management
     # ---
-
-    # TODO: Deprecated (LightRAG will never initialize storage automatically on creation，and finalize should be call before destroying)
-    auto_manage_storages_states: bool = field(default=False)
-    """If True, lightrag will automatically calls initialize_storages and finalize_storages at the appropriate times."""
 
     cosine_better_than_threshold: float = field(default=float(os.getenv('COSINE_THRESHOLD', 0.2)))
 
@@ -728,10 +731,10 @@ class LightRAG:
                 # 1. chunk_entity_relation_graph has entities and relations (count > 0)
                 # 2. full_entities and full_relations are empty
 
-                # Get all entity labels from graph
-                all_entity_labels = await self.chunk_entity_relation_graph.get_all_labels()
+                # Get all entity nodes from graph
+                all_entity_nodes = await self.chunk_entity_relation_graph.get_all_nodes()
 
-                if not all_entity_labels:
+                if not all_entity_nodes:
                     logger.debug('No entities found in graph, skipping migration check')
                     return
 
@@ -768,7 +771,7 @@ class LightRAG:
                         return
 
                     logger.info(
-                        f'Data migration needed: found {len(all_entity_labels)} entities in graph but no full_entities/full_relations data'
+                        'Data migration needed: found entities in graph but no full_entities/full_relations data'
                     )
 
                     # Perform migration
@@ -994,8 +997,9 @@ class LightRAG:
                 logger.info(f'Relation chunk_tracking migration completed: {total_migrated} records persisted')
 
     async def get_graph_labels(self):
-        text = await self.chunk_entity_relation_graph.get_all_labels()
-        return text
+        nodes = await self.chunk_entity_relation_graph.get_all_nodes()
+        labels = [node.get('entity_id') or node.get('id') for node in nodes]
+        return sorted({label for label in labels if label})
 
     async def get_knowledge_graph(
         self,
@@ -1100,78 +1104,13 @@ class LightRAG:
 
         return track_id
 
-    # TODO: deprecated, use insert instead
-    def insert_custom_chunks(
-        self,
-        full_text: str,
-        text_chunks: list[str],
-        doc_id: str | None = None,
-    ) -> None:
-        loop = always_get_an_event_loop()
-        loop.run_until_complete(self.ainsert_custom_chunks(full_text, text_chunks, doc_id))
-
-    # TODO: deprecated, use ainsert instead
-    async def ainsert_custom_chunks(self, full_text: str, text_chunks: list[str], doc_id: str | None = None) -> None:
-        update_storage = False
-        try:
-            # Clean input texts
-            full_text = sanitize_text_for_encoding(full_text)
-            text_chunks = [sanitize_text_for_encoding(chunk) for chunk in text_chunks]
-            file_path = ''
-
-            # Process cleaned texts
-            doc_key = compute_mdhash_id(full_text, prefix='doc-') if doc_id is None else str(doc_id)
-            new_docs = {doc_key: {'content': full_text, 'file_path': file_path}}
-
-            _add_doc_keys = await self.full_docs.filter_keys({doc_key})
-            new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
-            if not len(new_docs):
-                logger.warning('This document is already in the storage.')
-                return
-
-            update_storage = True
-            logger.info(f'Inserting {len(new_docs)} docs')
-
-            if not self.tokenizer:
-                raise ValueError('Tokenizer is not initialized')
-
-            inserting_chunks: dict[str, Any] = {}
-            for index, chunk_text in enumerate(text_chunks):
-                chunk_key = compute_mdhash_id(chunk_text, prefix='chunk-')
-                tokens = len(self.tokenizer.encode(chunk_text))
-                inserting_chunks[chunk_key] = {
-                    'content': chunk_text,
-                    'full_doc_id': doc_key,
-                    'tokens': tokens,
-                    'chunk_order_index': index,
-                    'file_path': file_path,
-                }
-
-            doc_ids = set(inserting_chunks.keys())
-            add_chunk_keys = await self.text_chunks.filter_keys(doc_ids)
-            inserting_chunks = {k: v for k, v in inserting_chunks.items() if k in add_chunk_keys}
-            if not len(inserting_chunks):
-                logger.warning('All chunks are already in the storage.')
-                return
-
-            tasks = [
-                self.chunks_vdb.upsert(inserting_chunks),
-                self._process_extract_entities(inserting_chunks),
-                self.full_docs.upsert(new_docs),
-                self.text_chunks.upsert(inserting_chunks),
-            ]
-            await asyncio.gather(*tasks)
-
-        finally:
-            if update_storage:
-                await self._insert_done()
-
     async def apipeline_enqueue_documents(
         self,
         input: str | list[str],
         ids: str | list[str] | None = None,
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -1186,6 +1125,7 @@ class LightRAG:
             ids: list of unique document IDs, if not provided, MD5 hash IDs will be generated
             file_paths: list of file paths corresponding to each document, used for citation
             track_id: tracking ID for monitoring processing status, if not provided, will be generated with "enqueue" prefix
+            metadata: optional metadata dict to store with documents (e.g., chunking_preset)
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -1259,6 +1199,7 @@ class LightRAG:
                 'updated_at': datetime.now(timezone.utc).isoformat(),
                 'file_path': content_data['file_path'],  # Store file path in document status
                 'track_id': track_id,  # Store track_id in document status
+                'metadata': metadata or {},  # Store metadata (e.g., chunking_preset)
             }
             for id_, content_data in contents.items()
         }
@@ -1638,6 +1579,7 @@ class LightRAG:
                     entity_relation_task: asyncio.Task[Any] | None = None
                     chunk_results: list[Any] = []
                     chunks: dict[str, Any] = {}
+                    doc_chunking_preset: str | None = None
 
                     async with semaphore:
                         nonlocal processed_count
@@ -1683,8 +1625,19 @@ class LightRAG:
                             if self.tokenizer is None:
                                 raise ValueError('Tokenizer is not initialized')
 
+                            # Check for per-document chunking preset in metadata
+                            doc_metadata = getattr(status_doc, 'metadata', {}) or {}
+                            doc_chunking_preset = doc_metadata.get('chunking_preset')
+
+                            # Use per-document preset if specified, otherwise use instance default
+                            if doc_chunking_preset is not None:
+                                # Create a temporary chunking function with the document's preset
+                                chunking_func = create_chunker(preset=doc_chunking_preset)
+                            else:
+                                chunking_func = self.chunking_func
+
                             # Call chunking function, supporting both sync and async implementations
-                            chunking_result = self.chunking_func(
+                            chunking_result = chunking_func(
                                 self.tokenizer,
                                 content,
                                 split_by_character,
@@ -1740,7 +1693,12 @@ class LightRAG:
                                             'updated_at': datetime.now(timezone.utc).isoformat(),
                                             'file_path': file_path,
                                             'track_id': status_doc.track_id,  # Preserve existing track_id
-                                            'metadata': {'processing_start_time': processing_start_time},
+                                            'metadata': {
+                                                'processing_start_time': processing_start_time,
+                                                'chunking_preset': doc_chunking_preset or 'semantic',
+                                                'chunk_token_size': self.chunk_token_size,
+                                                'chunk_overlap_token_size': self.chunk_overlap_token_size,
+                                            },
                                         }
                                     }
                                 )
@@ -1818,6 +1776,9 @@ class LightRAG:
                                         'metadata': {
                                             'processing_start_time': processing_start_time,
                                             'processing_end_time': processing_end_time,
+                                            'chunking_preset': doc_chunking_preset or 'semantic',
+                                            'chunk_token_size': self.chunk_token_size,
+                                            'chunk_overlap_token_size': self.chunk_overlap_token_size,
                                         },
                                     }
                                 }
@@ -1869,6 +1830,9 @@ class LightRAG:
                                             'metadata': {
                                                 'processing_start_time': processing_start_time,
                                                 'processing_end_time': processing_end_time,
+                                                'chunking_preset': doc_chunking_preset or 'semantic',
+                                                'chunk_token_size': self.chunk_token_size,
+                                                'chunk_overlap_token_size': self.chunk_overlap_token_size,
                                             },
                                         }
                                     }
@@ -1931,6 +1895,9 @@ class LightRAG:
                                             'metadata': {
                                                 'processing_start_time': processing_start_time,
                                                 'processing_end_time': processing_end_time,
+                                                'chunking_preset': doc_chunking_preset or 'semantic',
+                                                'chunk_token_size': self.chunk_token_size,
+                                                'chunk_overlap_token_size': self.chunk_overlap_token_size,
                                             },
                                         }
                                     }
@@ -2460,13 +2427,21 @@ class LightRAG:
             hl_keywords=param.hl_keywords,
             ll_keywords=param.ll_keywords,
             conversation_history=param.conversation_history,
-            history_turns=param.history_turns,
             model_func=param.model_func,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
         )
 
         query_result = None
+        final_data: dict[str, Any] = {
+            'status': 'failure',
+            'message': 'Query returned no results',
+            'data': {},
+            'metadata': {
+                'failure_reason': 'no_results',
+                'mode': data_param.mode,
+            },
+        }
 
         if data_param.mode in ['local', 'global', 'hybrid', 'mix']:
             logger.debug(f'[aquery_data] Using kg_query for mode: {data_param.mode}')
@@ -2523,6 +2498,8 @@ class LightRAG:
         elif isinstance(query_result, QueryResult):
             # Extract raw_data from QueryResult
             final_data = query_result.raw_data or {}
+        else:
+            logger.warning(f'[aquery_data] Unexpected query_result type: {type(query_result)}')
 
             # Log final result counts - adapt to new data format from convert_to_user_format
             if final_data and 'data' in final_data:
@@ -3113,7 +3090,7 @@ class LightRAG:
                     if not src or not tgt or 'source_id' not in edge_data:
                         continue
 
-                    edge_tuple: tuple[str, str] = tuple(sorted((src, tgt)))  # type: ignore[assignment]
+                    edge_tuple = (src, tgt) if src <= tgt else (tgt, src)
                     if edge_tuple in relationships_to_delete or edge_tuple in relationships_to_rebuild:
                         continue
 
@@ -3256,7 +3233,7 @@ class LightRAG:
                         if edges:
                             for src, tgt in edges:
                                 # Normalize edge representation (sorted for consistency)
-                                edge_tuple: tuple[str, str] = tuple(sorted((src, tgt)))  # type: ignore[assignment]
+                                edge_tuple = (src, tgt) if src <= tgt else (tgt, src)
                                 edges_to_delete.add(edge_tuple)
 
                                 if src in entities_to_delete and tgt in entities_to_delete:

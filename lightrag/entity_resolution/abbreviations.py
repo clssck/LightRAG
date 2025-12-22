@@ -8,6 +8,7 @@ Detects when one entity name is an abbreviation of another:
 This module provides Layer 1.5 detection (after exact match, before fuzzy).
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 # Words to skip when building acronyms from expanded forms
@@ -236,7 +237,7 @@ def detect_abbreviation(term_a: str, term_b: str) -> AbbreviationMatch | None:
 
 def find_abbreviation_match(
     entity_name: str,
-    candidates: list[str],
+    candidates: Sequence[str | None],
     min_confidence: float = 0.80,
 ) -> tuple[str, float] | None:
     """Find best abbreviation match for an entity among candidates.

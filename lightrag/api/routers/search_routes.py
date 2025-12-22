@@ -10,10 +10,10 @@ Use cases:
 - /search (this): Keyword search - "Find docs about X" -> Direct chunk results
 """
 
-from typing import Annotated, Any, ClassVar
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.kg.postgres_impl import PostgreSQLDB
@@ -43,8 +43,8 @@ class SearchResponse(BaseModel):
     count: int = Field(description='Number of results returned')
     workspace: str = Field(description='Workspace searched')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'query': 'machine learning algorithms',
                 'results': [
@@ -63,6 +63,7 @@ class SearchResponse(BaseModel):
                 'workspace': 'default',
             }
         }
+    )
 
 
 def create_search_routes(

@@ -11,10 +11,10 @@ Endpoints:
 from __future__ import annotations
 
 import time
-from typing import Any, ClassVar, Literal
+from typing import Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import QueryParam
@@ -69,8 +69,8 @@ class ExplainResponse(BaseModel):
     context_preview: str | None = Field(default=None, description='Preview of retrieved context (first 500 chars)')
     success: bool = Field(description='Whether query returned results')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'query': 'What are the key features?',
                 'mode': 'mix',
@@ -90,6 +90,7 @@ class ExplainResponse(BaseModel):
                 'success': True,
             }
         }
+    )
 
 
 def create_explain_routes(rag, api_key: str | None = None) -> APIRouter:

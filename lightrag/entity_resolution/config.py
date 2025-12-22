@@ -42,7 +42,7 @@ class EntityResolutionConfig:
     max_candidates: int = 3
 
     # LLM verification prompt template
-    llm_prompt_template: str = field(
+    llm_prompt_template: str | None = field(
         default="""Are these two terms referring to the same entity?
 Consider typos, misspellings, abbreviations, or alternate names.
 

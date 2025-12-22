@@ -348,25 +348,14 @@ export default function RetrievalTesting() {
         state.addUserPromptToHistory(state.querySettings.user_prompt.trim())
       }
 
-      // Determine the effective mode
-      const effectiveMode = modeOverride || state.querySettings.mode
-
-      // Determine effective history turns with bypass override
-      const configuredHistoryTurns = state.querySettings.history_turns || 0
-      const effectiveHistoryTurns =
-        effectiveMode === 'bypass' && configuredHistoryTurns === 0 ? 3 : configuredHistoryTurns
-
       const queryParams = {
         ...state.querySettings,
         query: actualQuery,
         response_type: 'Multiple Paragraphs',
         conversation_history:
-          effectiveHistoryTurns > 0
-            ? prevMessages
-                .filter((m) => m.isError !== true)
-                .slice(-effectiveHistoryTurns * 2)
-                .map((m) => ({ role: m.role, content: m.content }))
-            : [],
+          prevMessages
+            .filter((m) => m.isError !== true)
+            .map((m) => ({ role: m.role, content: m.content })),
         ...(modeOverride ? { mode: modeOverride } : {}),
       }
 

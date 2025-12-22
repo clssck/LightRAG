@@ -37,7 +37,6 @@ from lightrag.constants import (
     SOURCE_IDS_LIMIT_METHOD_KEEP,
 )
 from lightrag.exceptions import (
-    ChunkTokenLimitExceededError,
     PipelineCancelledException,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
@@ -96,94 +95,161 @@ def _truncate_entity_identifier(identifier: str, limit: int, chunk_key: str, ide
     return display_value
 
 
-def chunking_by_token_size(
-    tokenizer: Tokenizer,
+def chunking_by_semantic(
     content: str,
-    split_by_character: str | None = None,
-    split_by_character_only: bool = False,
-    chunk_overlap_token_size: int = 100,
-    chunk_token_size: int = 1200,
+    max_chars: int = 4800,
+    max_overlap: int = 400,
+    preset: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Split content into chunks by token size.
+    """Split content into chunks using Kreuzberg's intelligent chunking.
 
-    Returns chunks with optional `char_start`/`char_end` offsets for citations.
-    Offsets are exact when splitting by delimiter; for token-window chunking
-    they are best-effort approximations (especially when overlap is used).
+    Kreuzberg supports multiple chunking strategies via presets:
+    - None (default): Basic chunking with size limits
+    - 'recursive': Split by paragraphs, then sentences, then words
+    - 'semantic': Preserve semantic boundaries for better coherence
+
+    Args:
+        content: The text content to chunk
+        max_chars: Maximum characters per chunk (~1200 tokens at 4 chars/token)
+        max_overlap: Character overlap between chunks (~100 tokens)
+        preset: Chunking preset - None, 'recursive', or 'semantic'
+
+    Returns:
+        List of chunk dicts with keys: tokens, content, chunk_order_index, char_start, char_end
+
+    Raises:
+        ImportError: If kreuzberg is not installed
     """
-    tokens = tokenizer.encode(content)
-    results: list[dict[str, Any]] = []
-    if split_by_character:
-        raw_chunks = content.split(split_by_character)
-        # Track character positions: (tokens, chunk_text, char_start, char_end)
-        new_chunks: list[tuple[int, str, int, int]] = []
-        char_position = 0
-        separator_len = len(split_by_character)
-        if split_by_character_only:
-            for chunk in raw_chunks:
-                _tokens = tokenizer.encode(chunk)
-                if len(_tokens) > chunk_token_size:
-                    logger.warning(
-                        'Chunk split_by_character exceeds token limit: len=%d limit=%d',
-                        len(_tokens),
-                        chunk_token_size,
-                    )
-                    raise ChunkTokenLimitExceededError(
-                        chunk_tokens=len(_tokens),
-                        chunk_token_limit=chunk_token_size,
-                        chunk_preview=chunk[:120],
-                    )
-                chunk_start = char_position
-                chunk_end = char_position + len(chunk)
-                new_chunks.append((len(_tokens), chunk, chunk_start, chunk_end))
-                char_position = chunk_end + separator_len  # Skip separator
-        else:
-            for chunk in raw_chunks:
-                chunk_start = char_position
-                _tokens = tokenizer.encode(chunk)
-                if len(_tokens) > chunk_token_size:
-                    # Sub-chunking: approximate char positions within the chunk
-                    sub_char_position = 0
-                    for start in range(0, len(_tokens), chunk_token_size - chunk_overlap_token_size):
-                        chunk_content = tokenizer.decode(_tokens[start : start + chunk_token_size])
-                        # Approximate char position based on content length ratio
-                        sub_start = chunk_start + sub_char_position
-                        sub_end = sub_start + len(chunk_content)
-                        new_chunks.append((min(chunk_token_size, len(_tokens) - start), chunk_content, sub_start, sub_end))
-                        sub_char_position += len(chunk_content) - (chunk_overlap_token_size * 4)  # Approx overlap
-                else:
-                    chunk_end = chunk_start + len(chunk)
-                    new_chunks.append((len(_tokens), chunk, chunk_start, chunk_end))
-                char_position = chunk_start + len(chunk) + separator_len
+    try:
+        from kreuzberg import ChunkingConfig, ExtractionConfig, extract_bytes_sync
+    except ImportError:
+        raise ImportError(
+            'kreuzberg is not installed. Install with: pip install kreuzberg'
+        ) from None
 
-        for index, (_len, chunk, char_start, char_end) in enumerate(new_chunks):
-            results.append(
-                {
-                    'tokens': _len,
-                    'content': chunk.strip(),
-                    'chunk_order_index': index,
-                    'char_start': char_start,
-                    'char_end': char_end,
-                }
-            )
+    # Build chunking config with optional preset
+    chunking_kwargs: dict[str, Any] = {
+        'max_chars': max_chars,
+        'max_overlap': max_overlap,
+    }
+    if preset:
+        chunking_kwargs['preset'] = preset
+
+    config = ExtractionConfig(
+        chunking=ChunkingConfig(**chunking_kwargs)
+    )
+
+    # Kreuzberg expects bytes with MIME type for text
+    result = extract_bytes_sync(
+        content.encode('utf-8'),
+        mime_type='text/plain',
+        config=config,
+    )
+
+    results: list[dict[str, Any]] = []
+    if result.chunks:
+        for index, chunk in enumerate(result.chunks):
+            # Kreuzberg returns chunks as dicts with 'content' key
+            if isinstance(chunk, dict):
+                chunk_content = chunk.get('content', '')
+                metadata = chunk.get('metadata', {})
+                char_start = metadata.get('byte_start', metadata.get('char_start'))
+                char_end = metadata.get('byte_end', metadata.get('char_end'))
+            else:
+                # Fallback for object-style chunks
+                chunk_content = getattr(chunk, 'content', str(chunk))
+                char_start = getattr(chunk, 'start_char', None)
+                char_end = getattr(chunk, 'end_char', None)
+
+            # Estimate offsets if not provided
+            if char_start is None:
+                # Try to find chunk position in content; use 0 if not found
+                search_str = chunk_content[:50] if len(chunk_content) > 50 else chunk_content
+                found_pos = content.find(search_str)
+                char_start = found_pos if found_pos >= 0 else 0
+            if char_end is None:
+                char_end = char_start + len(chunk_content)
+
+            # Estimate token count (~4 chars per token)
+            tokens = len(chunk_content) // 4
+
+            results.append({
+                'tokens': tokens,
+                'content': chunk_content.strip(),
+                'chunk_order_index': index,
+                'char_start': max(0, char_start),
+                'char_end': char_end,
+            })
     else:
-        # Token-based chunking: track character positions through decoded content
-        char_position = 0
-        for index, start in enumerate(range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)):
-            chunk_content = tokenizer.decode(tokens[start : start + chunk_token_size])
-            # For overlapping chunks, approximate positions based on previous chunk
-            char_start = 0 if index == 0 else char_position
-            char_end = char_start + len(chunk_content)
-            char_position = char_start + len(chunk_content) - (chunk_overlap_token_size * 4)  # Approx char overlap
-            results.append(
-                {
-                    'tokens': min(chunk_token_size, len(tokens) - start),
-                    'content': chunk_content.strip(),
-                    'chunk_order_index': index,
-                    'char_start': char_start,
-                    'char_end': char_end,
-                }
-            )
+        # Fallback: return whole content as single chunk
+        results.append({
+            'tokens': len(content) // 4,
+            'content': content.strip(),
+            'chunk_order_index': 0,
+            'char_start': 0,
+            'char_end': len(content),
+        })
+
     return results
+
+
+def create_chunker(
+    preset: str | None = None,
+) -> Callable[
+    [Tokenizer | None, str, str | None, bool, int, int],
+    list[dict[str, Any]],
+]:
+    """Create a semantic chunking function compatible with LightRAG's chunking_func interface.
+
+    This factory creates a wrapper around Kreuzberg's semantic chunking that matches
+    the expected signature for LightRAG's chunking_func parameter.
+
+    Args:
+        preset: Kreuzberg chunking preset - 'recursive', 'semantic', or None
+            - None (default): Basic chunking with size limits
+            - 'recursive': Split by paragraphs, then sentences, then words
+            - 'semantic': Preserve semantic boundaries for better coherence
+
+    Returns:
+        A chunking function with signature compatible with LightRAG.chunking_func
+
+    Example:
+        >>> from lightrag import LightRAG
+        >>> from lightrag.operate import create_chunker
+        >>>
+        >>> # Use semantic chunking with recursive preset
+        >>> rag = LightRAG(
+        ...     working_dir="./storage",
+        ...     chunking_func=create_chunker(preset='recursive')
+        ... )
+    """
+    def semantic_chunking_adapter(
+        tokenizer: Tokenizer | None,
+        content: str,
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+        chunk_overlap_token_size: int = 100,
+        chunk_token_size: int = 1200,
+    ) -> list[dict[str, Any]]:
+        """Adapter that wraps chunking_by_semantic with LightRAG's expected signature.
+
+        Note: tokenizer, split_by_character, and split_by_character_only are ignored
+        since Kreuzberg handles tokenization and boundary detection internally.
+        """
+        # Mark unused parameters (Kreuzberg handles these internally)
+        _ = tokenizer, split_by_character, split_by_character_only
+        # Convert token sizes to character sizes (~4 chars per token)
+        max_chars = chunk_token_size * 4
+        max_overlap = chunk_overlap_token_size * 4
+
+        return chunking_by_semantic(
+            content=content,
+            max_chars=max_chars,
+            max_overlap=max_overlap,
+            preset=preset,
+        )
+
+    return semantic_chunking_adapter
 
 
 async def _handle_entity_relation_summary(

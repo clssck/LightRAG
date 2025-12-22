@@ -552,6 +552,7 @@ async def _run_clustering_background(
     from lightrag.entity_resolution.clustering import (
         ClusteringConfig,
         cluster_entities_batch,
+        process_clustering_results,
     )
     from lightrag.entity_resolution.resolver import llm_verify as llm_verify_fn
     from lightrag.entity_resolution.resolver import store_alias
@@ -577,13 +578,13 @@ async def _run_clustering_background(
         mode_desc = 'dry run' if dry_run else ('auto-merge' if auto_merge else 'store aliases')
         async with lock:
             status['busy'] = True
-            status['job_name'] = f'Entity Clustering ({mode_desc})'
+            status['job_name'] = 'Entity Clustering'
             status['job_start'] = datetime.now(timezone.utc).isoformat()
             status['total_items'] = 0
             status['processed_items'] = 0
             status['results_count'] = 0
             status['cancellation_requested'] = False
-            status['latest_message'] = 'Starting clustering...'
+            status['latest_message'] = f'Starting clustering ({mode_desc})...'
 
         # Get all entities with embeddings
         db = rag.entities_vdb._db_required()
@@ -639,12 +640,27 @@ async def _run_clustering_background(
 
         async with lock:
             status['results_count'] = len(result.clusters)
+            status['processed_items'] = len(entities)
             status['latest_message'] = f'Found {len(result.clusters)} clusters'
 
         if dry_run:
             async with lock:
-                status['processed_items'] = len(entities)
                 status['latest_message'] = f'Dry run complete: {len(result.clusters)} clusters found'
+            return
+
+        if not llm_verify and not auto_merge:
+            process_stats = await process_clustering_results(
+                result,
+                db=db,
+                workspace=workspace,
+                dry_run=False,
+            )
+            stats['aliases_stored'] = process_stats.get('aliases_stored', 0)
+            async with lock:
+                status['latest_message'] = (
+                    f"Complete: {process_stats.get('clusters', 0)} clusters, "
+                    f"{stats['aliases_stored']} aliases stored"
+                )
             return
 
         # Process each cluster

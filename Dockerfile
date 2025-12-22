@@ -63,6 +63,10 @@ RUN mkdir -p /app/data/tiktoken \
     && uv run lightrag-download-cache --cache-dir /app/data/tiktoken || status=$?; \
     if [ -n "${status:-}" ] && [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
 
+# Setup pdfium symlink for Kreuzberg PDF support
+# Kreuzberg needs libpdfium which is bundled with pypdfium2
+RUN uv run python -c "from lightrag.document.kreuzberg_adapter import _setup_pdfium_for_kreuzberg; _setup_pdfium_for_kreuzberg()"
+
 # Final stage
 FROM python:3.13-slim
 
@@ -91,9 +95,11 @@ ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
 
 # Install dependencies with uv sync (uses locked versions from uv.lock)
 # And ensure pip is available for runtime installs
+# Also setup pdfium symlink for Kreuzberg PDF support
 RUN --mount=type=cache,target=/root/.local/share/uv \
     uv sync --frozen --no-dev --extra api --no-editable \
-    && /app/.venv/bin/python -m ensurepip --upgrade
+    && /app/.venv/bin/python -m ensurepip --upgrade \
+    && /app/.venv/bin/python -c "from lightrag.document.kreuzberg_adapter import _setup_pdfium_for_kreuzberg; _setup_pdfium_for_kreuzberg()"
 
 # Create persistent data directories AFTER package installation
 RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/tiktoken

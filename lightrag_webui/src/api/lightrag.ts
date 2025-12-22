@@ -183,8 +183,6 @@ export type QueryRequest = {
    * Format: [{"role": "user/assistant", "content": "message"}].
    */
   conversation_history?: Message[]
-  /** Number of complete conversation turns (user-assistant pairs) to consider in the response context. */
-  history_turns?: number
   /** User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template. */
   user_prompt?: string
   /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
@@ -433,11 +431,6 @@ export const checkHealth = async (): Promise<
   }
 }
 
-export const getDocuments = async (): Promise<DocsStatusesResponse> => {
-  const response = await axiosInstance.get('/documents')
-  return response.data
-}
-
 export const scanNewDocuments = async (): Promise<ScanResponse> => {
   const response = await axiosInstance.post('/documents/scan')
   return response.data
@@ -661,12 +654,18 @@ export const insertTexts = async (texts: string[]): Promise<DocActionResponse> =
   return response.data
 }
 
+export type ChunkingPreset = 'semantic' | 'recursive' | ''
+
 export const uploadDocument = async (
   file: File,
-  onUploadProgress?: (percentCompleted: number) => void
+  onUploadProgress?: (percentCompleted: number) => void,
+  chunkingPreset?: ChunkingPreset
 ): Promise<DocActionResponse> => {
   const formData = new FormData()
   formData.append('file', file)
+  if (chunkingPreset) {
+    formData.append('chunking_preset', chunkingPreset)
+  }
 
   const response = await axiosInstance.post('/documents/upload', formData, {
     headers: {
@@ -688,13 +687,18 @@ export const uploadDocument = async (
 
 export const batchUploadDocuments = async (
   files: File[],
-  onUploadProgress?: (fileName: string, percentCompleted: number) => void
+  onUploadProgress?: (fileName: string, percentCompleted: number) => void,
+  chunkingPreset?: ChunkingPreset
 ): Promise<DocActionResponse[]> => {
   return await Promise.all(
     files.map(async (file) => {
-      return await uploadDocument(file, (percentCompleted) => {
-        onUploadProgress?.(file.name, percentCompleted)
-      })
+      return await uploadDocument(
+        file,
+        (percentCompleted) => {
+          onUploadProgress?.(file.name, percentCompleted)
+        },
+        chunkingPreset
+      )
     })
   )
 }

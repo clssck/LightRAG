@@ -1,9 +1,9 @@
-import { UploadIcon } from 'lucide-react'
+import { ChevronDown, ChevronRight, UploadIcon } from 'lucide-react'
 import { useCallback, useState } from 'react'
 import type { FileRejection } from 'react-dropzone'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { uploadDocument } from '@/api/lightrag'
+import { type ChunkingPreset, uploadDocument } from '@/api/lightrag'
 import Button from '@/components/ui/Button'
 import {
   Dialog,
@@ -14,6 +14,13 @@ import {
   DialogTrigger,
 } from '@/components/ui/Dialog'
 import FileUploader from '@/components/ui/FileUploader'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/Select'
 import { errorMessage } from '@/lib/utils'
 
 interface UploadDocumentsDialogProps {
@@ -26,6 +33,8 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
   const [isUploading, setIsUploading] = useState(false)
   const [progresses, setProgresses] = useState<Record<string, number>>({})
   const [fileErrors, setFileErrors] = useState<Record<string, string>>({})
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [chunkingPreset, setChunkingPreset] = useState<ChunkingPreset>('semantic')
 
   const handleRejectedFiles = useCallback(
     (rejectedFiles: FileRejection[]) => {
@@ -94,18 +103,22 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
               [file.name]: 0,
             }))
 
-            const result = await uploadDocument(file, (percentCompleted: number) => {
-              console.debug(
-                t('documentPanel.uploadDocuments.single.uploading', {
-                  name: file.name,
-                  percent: percentCompleted,
-                })
-              )
-              setProgresses((pre) => ({
-                ...pre,
-                [file.name]: percentCompleted,
-              }))
-            })
+            const result = await uploadDocument(
+              file,
+              (percentCompleted: number) => {
+                console.debug(
+                  t('documentPanel.uploadDocuments.single.uploading', {
+                    name: file.name,
+                    percent: percentCompleted,
+                  })
+                )
+                setProgresses((pre) => ({
+                  ...pre,
+                  [file.name]: percentCompleted,
+                }))
+              },
+              chunkingPreset
+            )
 
             if (result.status === 'duplicated') {
               uploadErrors[file.name] = t(
@@ -185,7 +198,7 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
         setIsUploading(false)
       }
     },
-    [t, onDocumentsUploaded]
+    [t, onDocumentsUploaded, chunkingPreset]
   )
 
   return (
@@ -217,6 +230,57 @@ export default function UploadDocumentsDialog({ onDocumentsUploaded }: UploadDoc
           <DialogTitle>{t('documentPanel.uploadDocuments.title')}</DialogTitle>
           <DialogDescription>{t('documentPanel.uploadDocuments.description')}</DialogDescription>
         </DialogHeader>
+
+        {/* Advanced Options (Collapsible) */}
+        <div className="space-y-3">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            className="text-muted-foreground hover:text-foreground flex items-center gap-1 text-sm transition-colors"
+            disabled={isUploading}
+          >
+            {showAdvanced ? (
+              <ChevronDown className="h-4 w-4" />
+            ) : (
+              <ChevronRight className="h-4 w-4" />
+            )}
+            {t('documentPanel.uploadDocuments.advancedOptions')}
+          </button>
+
+          {showAdvanced && (
+            <div className="bg-muted/50 space-y-3 rounded-md border p-3">
+              <div className="space-y-1.5">
+                <label htmlFor="chunking-preset" className="text-sm font-medium">
+                  {t('documentPanel.uploadDocuments.chunkingPreset.label')}
+                </label>
+                <Select
+                  value={chunkingPreset}
+                  onValueChange={(v) => setChunkingPreset(v as ChunkingPreset)}
+                  disabled={isUploading}
+                >
+                  <SelectTrigger id="chunking-preset" className="h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="semantic">
+                      {t('documentPanel.uploadDocuments.chunkingPreset.semantic')}
+                    </SelectItem>
+                    <SelectItem value="recursive">
+                      {t('documentPanel.uploadDocuments.chunkingPreset.recursive')}
+                    </SelectItem>
+                    <SelectItem value="">
+                      {t('documentPanel.uploadDocuments.chunkingPreset.basic')}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-muted-foreground text-xs">
+                  {t('documentPanel.uploadDocuments.chunkingPreset.description')}
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+
         <FileUploader
           maxFileCount={Number.POSITIVE_INFINITY}
           maxSize={200 * 1024 * 1024}

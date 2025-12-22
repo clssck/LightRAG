@@ -95,6 +95,10 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
         }
       }
 
+      if (health.configuration) {
+        useSettingsStore.getState().setStorageConfig(health.configuration)
+      }
+
       set({
         health: true,
         message: null,

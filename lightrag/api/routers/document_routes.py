@@ -6,9 +6,8 @@ import asyncio
 import traceback
 from datetime import datetime, timezone
 from functools import lru_cache
-from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal
+from typing import Annotated, Any, Literal
 
 import aiofiles
 from fastapi import (
@@ -16,15 +15,15 @@ from fastapi import (
     BackgroundTasks,
     Depends,
     File,
+    Form,
     HTTPException,
     UploadFile,
 )
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lightrag import LightRAG
-from lightrag.api.config import global_args
 from lightrag.api.utils_api import get_combined_auth_dependency
-from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
+from lightrag.base import DeletionResult, DocStatus
 from lightrag.utils import (
     compute_mdhash_id,
     generate_track_id,
@@ -35,17 +34,17 @@ from lightrag.utils import (
 
 
 @lru_cache(maxsize=1)
-def _is_docling_available() -> bool:
-    """Check if docling is available (cached check).
+def _is_kreuzberg_available() -> bool:
+    """Check if kreuzberg is available (cached check).
 
-    This function uses lru_cache to avoid repeated import attempts.
-    The result is cached after the first call.
+    Kreuzberg is a high-performance document processing engine with Rust core,
+    supporting 56+ document formats with built-in OCR and RAG chunking.
 
     Returns:
-        bool: True if docling is available, False otherwise
+        bool: True if kreuzberg is available, False otherwise
     """
     try:
-        import docling  # noqa: F401  # type: ignore[import-not-found]
+        import kreuzberg  # noqa: F401  # type: ignore[import-not-found]
 
         return True
     except ImportError:
@@ -141,14 +140,15 @@ class ScanResponse(BaseModel):
     message: str | None = Field(default=None, description='Additional details about the scanning operation')
     track_id: str = Field(description='Tracking ID for monitoring scanning progress')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'scanning_started',
                 'message': 'Scanning process has been initiated in the background',
                 'track_id': 'scan_20250729_170612_abc123',
             }
         }
+    )
 
 
 class ReprocessResponse(BaseModel):
@@ -167,14 +167,15 @@ class ReprocessResponse(BaseModel):
         description='Always empty string. Reprocessed documents retain their original track_id from initial upload.',
     )
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'reprocessing_started',
                 'message': 'Reprocessing of failed documents has been initiated in background',
                 'track_id': '',
             }
         }
+    )
 
 
 class CancelPipelineResponse(BaseModel):
@@ -188,13 +189,14 @@ class CancelPipelineResponse(BaseModel):
     status: Literal['cancellation_requested', 'not_busy'] = Field(description='Status of the cancellation request')
     message: str = Field(description='Human-readable message describing the operation')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'cancellation_requested',
                 'message': 'Pipeline cancellation has been requested. Documents will be marked as FAILED.',
             }
         }
+    )
 
 
 class InsertTextRequest(BaseModel):
@@ -223,13 +225,14 @@ class InsertTextRequest(BaseModel):
             return None
         return file_source.strip()
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'text': 'This is a sample text to be inserted into the RAG system.',
                 'file_source': 'Source of the text (optional)',
             }
         }
+    )
 
 
 class InsertTextsRequest(BaseModel):
@@ -258,8 +261,8 @@ class InsertTextsRequest(BaseModel):
             return None
         return [file_source.strip() for file_source in file_sources]
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'texts': [
                     'This is the first text to be inserted.',
@@ -270,6 +273,7 @@ class InsertTextsRequest(BaseModel):
                 ],
             }
         }
+    )
 
 
 class InsertResponse(BaseModel):
@@ -287,14 +291,15 @@ class InsertResponse(BaseModel):
     message: str = Field(description='Message describing the operation result')
     track_id: str = Field(description='Tracking ID for monitoring processing status')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'success',
                 'message': "File 'document.pdf' uploaded successfully. Processing will continue in background.",
                 'track_id': 'upload_20250729_170612_abc123',
             }
         }
+    )
 
 
 class ClearDocumentsResponse(BaseModel):
@@ -308,13 +313,14 @@ class ClearDocumentsResponse(BaseModel):
     status: Literal['success', 'partial_success', 'busy', 'fail'] = Field(description='Status of the clear operation')
     message: str = Field(description='Message describing the operation result')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'success',
                 'message': 'All documents cleared successfully. Deleted 15 files.',
             }
         }
+    )
 
 
 class ClearCacheRequest(BaseModel):
@@ -324,8 +330,7 @@ class ClearCacheRequest(BaseModel):
     All cache will be cleared regardless of the request content.
     """
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {'example': {}}
+    model_config = ConfigDict(json_schema_extra={'example': {}})
 
 
 class ClearCacheResponse(BaseModel):
@@ -339,29 +344,14 @@ class ClearCacheResponse(BaseModel):
     status: Literal['success', 'fail'] = Field(description='Status of the clear operation')
     message: str = Field(description='Message describing the operation result')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'success',
                 'message': "Successfully cleared cache for modes: ['default', 'naive']",
             }
         }
-
-
-"""Response model for document status
-
-Attributes:
-    id: Document identifier
-    content_summary: Summary of document content
-    content_length: Length of document content
-    status: Current processing status
-    created_at: Creation timestamp (ISO format string)
-    updated_at: Last update timestamp (ISO format string)
-    chunks_count: Number of chunks (optional)
-    error: Error message if any (optional)
-    metadata: Additional metadata (optional)
-    file_path: Path to the document file
-"""
+    )
 
 
 class DeleteDocRequest(BaseModel):
@@ -431,8 +421,8 @@ class DocStatusResponse(BaseModel):
     file_path: str | None = Field(default=None, description='Path to the document file')
     s3_key: str | None = Field(default=None, description='S3 storage key for archived documents')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'id': 'doc_123456',
                 'content_summary': 'Research paper on machine learning',
@@ -448,72 +438,7 @@ class DocStatusResponse(BaseModel):
                 's3_key': 'archive/default/doc_123456/research_paper.pdf',
             }
         }
-
-
-class DocsStatusesResponse(BaseModel):
-    """Response model for document statuses
-
-    Attributes:
-        statuses: Dictionary mapping document status to lists of document status responses
-    """
-
-    statuses: dict[DocStatus, list[DocStatusResponse]] = Field(
-        default_factory=dict,
-        description='Dictionary mapping document status to lists of document status responses',
     )
-
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
-            'example': {
-                'statuses': {
-                    'PENDING': [
-                        {
-                            'id': 'doc_123',
-                            'content_summary': 'Pending document',
-                            'content_length': 5000,
-                            'status': 'pending',
-                            'created_at': '2025-03-31T10:00:00',
-                            'updated_at': '2025-03-31T10:00:00',
-                            'track_id': 'upload_20250331_100000_abc123',
-                            'chunks_count': None,
-                            'error': None,
-                            'metadata': None,
-                            'file_path': 'pending_doc.pdf',
-                        }
-                    ],
-                    'PREPROCESSED': [
-                        {
-                            'id': 'doc_789',
-                            'content_summary': 'Document pending final indexing',
-                            'content_length': 7200,
-                            'status': 'preprocessed',
-                            'created_at': '2025-03-31T09:30:00',
-                            'updated_at': '2025-03-31T09:35:00',
-                            'track_id': 'upload_20250331_093000_xyz789',
-                            'chunks_count': 10,
-                            'error': None,
-                            'metadata': None,
-                            'file_path': 'preprocessed_doc.pdf',
-                        }
-                    ],
-                    'PROCESSED': [
-                        {
-                            'id': 'doc_456',
-                            'content_summary': 'Processed document',
-                            'content_length': 8000,
-                            'status': 'processed',
-                            'created_at': '2025-03-31T09:00:00',
-                            'updated_at': '2025-03-31T09:05:00',
-                            'track_id': 'insert_20250331_090000_def456',
-                            'chunks_count': 8,
-                            'error': None,
-                            'metadata': {'author': 'John Doe'},
-                            'file_path': 'processed_doc.pdf',
-                        }
-                    ],
-                }
-            }
-        }
 
 
 class TrackStatusResponse(BaseModel):
@@ -531,8 +456,8 @@ class TrackStatusResponse(BaseModel):
     total_count: int = Field(description='Total number of documents for this track_id')
     status_summary: dict[str, int] = Field(description='Count of documents by status')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'track_id': 'upload_20250729_170612_abc123',
                 'documents': [
@@ -554,6 +479,7 @@ class TrackStatusResponse(BaseModel):
                 'status_summary': {'PROCESSED': 1},
             }
         }
+    )
 
 
 class DocumentsRequest(BaseModel):
@@ -577,8 +503,8 @@ class DocumentsRequest(BaseModel):
     )
     sort_direction: Literal['asc', 'desc'] = Field(default='desc', description='Sort direction')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status_filter': 'PROCESSED',
                 'page': 1,
@@ -587,6 +513,7 @@ class DocumentsRequest(BaseModel):
                 'sort_direction': 'desc',
             }
         }
+    )
 
 
 class PaginationInfo(BaseModel):
@@ -608,8 +535,8 @@ class PaginationInfo(BaseModel):
     has_next: bool = Field(description='Whether there is a next page')
     has_prev: bool = Field(description='Whether there is a previous page')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'page': 1,
                 'page_size': 50,
@@ -619,6 +546,7 @@ class PaginationInfo(BaseModel):
                 'has_prev': False,
             }
         }
+    )
 
 
 class PaginatedDocsResponse(BaseModel):
@@ -634,8 +562,8 @@ class PaginatedDocsResponse(BaseModel):
     pagination: PaginationInfo = Field(description='Pagination information')
     status_counts: dict[str, int] = Field(description='Count of documents by status for all documents')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'documents': [
                     {
@@ -669,6 +597,7 @@ class PaginatedDocsResponse(BaseModel):
                 },
             }
         }
+    )
 
 
 class StatusCountsResponse(BaseModel):
@@ -680,8 +609,8 @@ class StatusCountsResponse(BaseModel):
 
     status_counts: dict[str, int] = Field(description='Count of documents by status')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status_counts': {
                     'PENDING': 10,
@@ -692,6 +621,7 @@ class StatusCountsResponse(BaseModel):
                 }
             }
         }
+    )
 
 
 class PipelineStatusResponse(BaseModel):
@@ -729,8 +659,7 @@ class PipelineStatusResponse(BaseModel):
         """Process datetime and return as ISO format string with timezone"""
         return format_datetime(value)
 
-    class Config:
-        extra = 'allow'  # Allow additional fields from the pipeline status
+    model_config = ConfigDict(extra='allow')
 
 
 class DocumentManager:
@@ -893,278 +822,41 @@ def get_unique_filename_in_enqueued(target_dir: Path, original_name: str) -> str
     return f'{base_name}_{timestamp}{extension}'
 
 
-# Document processing helper functions (synchronous)
-# These functions run in thread pool via asyncio.to_thread() to avoid blocking the event loop
+# Document processing helper function (synchronous)
+# Runs in thread pool via asyncio.to_thread() to avoid blocking the event loop
 
 
-def _convert_with_docling(file_path: Path) -> str:
-    """Convert document using docling (synchronous).
+def _convert_with_kreuzberg(file_path: Path) -> str:
+    """Convert document using kreuzberg (synchronous).
+
+    Kreuzberg is a high-performance document intelligence framework
+    supporting 56+ formats with Rust core.
 
     Args:
         file_path: Path to the document file
 
     Returns:
-        str: Extracted markdown content
-    """
-    from docling.document_converter import DocumentConverter  # type: ignore
-
-    converter = DocumentConverter()
-    result = converter.convert(file_path)
-    return result.document.export_to_markdown()
-
-
-def _extract_pdf_pypdf(file_bytes: bytes, password: str | None = None) -> str:
-    """Extract PDF content using pypdf (synchronous).
-
-    Args:
-        file_bytes: PDF file content as bytes
-        password: Optional password for encrypted PDFs
-
-    Returns:
-        str: Extracted text content
-
-    Raises:
-        Exception: If PDF is encrypted and password is incorrect or missing
-    """
-    from pypdf import PdfReader  # type: ignore
-
-    pdf_file = BytesIO(file_bytes)
-    reader = PdfReader(pdf_file)
-
-    # Check if PDF is encrypted
-    if reader.is_encrypted:
-        if not password:
-            raise Exception('PDF is encrypted but no password provided')
-
-        decrypt_result = reader.decrypt(password)
-        if decrypt_result == 0:
-            raise Exception('Incorrect PDF password')
-
-    # Extract text from all pages
-    content = ''
-    for page in reader.pages:
-        content += page.extract_text() + '\n'
-
-    return content
-
-
-def _extract_docx(file_bytes: bytes) -> str:
-    """Extract DOCX content including tables in document order (synchronous).
-
-    Args:
-        file_bytes: DOCX file content as bytes
-
-    Returns:
-        str: Extracted text content with tables in their original positions.
-             Tables are separated from paragraphs with blank lines for clarity.
-    """
-    from docx import Document  # type: ignore
-    from docx.table import Table  # type: ignore
-    from docx.text.paragraph import Paragraph  # type: ignore
-
-    docx_file = BytesIO(file_bytes)
-    doc = Document(docx_file)
-
-    def escape_cell(cell_value: object | None) -> str:
-        """Escape characters that would break tab-delimited layout.
-
-        Escape order is critical: backslashes first, then tabs/newlines.
-        This prevents double-escaping issues.
-
-        Args:
-            cell_value: The cell value to escape (can be None or str)
-
-        Returns:
-            str: Escaped cell value safe for tab-delimited format
-        """
-        if cell_value is None:
-            return ''
-        text = str(cell_value)
-        # CRITICAL: Escape backslash first to avoid double-escaping
-        return (
-            text.replace('\\', '\\\\')  # Must be first: \ -> \\
-            .replace('\t', '\\t')  # Tab -> \t (visible)
-            .replace('\r\n', '\\n')  # Windows newline -> \n
-            .replace('\r', '\\n')  # Mac newline -> \n
-            .replace('\n', '\\n')  # Unix newline -> \n
-        )
-
-    content_parts = []
-    in_table = False  # Track if we're currently processing a table
-
-    # Iterate through all body elements in document order
-    for element in doc.element.body:
-        # Check if element is a paragraph
-        if element.tag.endswith('p'):
-            # If coming out of a table, add blank line after table
-            if in_table:
-                content_parts.append('')  # Blank line after table
-                in_table = False
-
-            paragraph = Paragraph(element, doc)
-            text = paragraph.text
-            # Always append to preserve document spacing (including blank paragraphs)
-            content_parts.append(text)
-
-        # Check if element is a table
-        elif element.tag.endswith('tbl'):
-            # Add blank line before table (if content exists)
-            if content_parts and not in_table:
-                content_parts.append('')  # Blank line before table
-
-            in_table = True
-            table = Table(element, doc)
-            for row in table.rows:
-                row_text = []
-                for cell in row.cells:
-                    cell_text = cell.text
-                    # Escape special characters to preserve tab-delimited structure
-                    row_text.append(escape_cell(cell_text))
-                # Only add row if at least one cell has content
-                if any(cell for cell in row_text):
-                    content_parts.append('\t'.join(row_text))
-
-    return '\n'.join(content_parts)
-
-
-def _extract_pptx(file_bytes: bytes) -> str:
-    """Extract PPTX content (synchronous).
-
-    Args:
-        file_bytes: PPTX file content as bytes
-
-    Returns:
         str: Extracted text content
     """
+    from kreuzberg import extract_file_sync  # type: ignore[import-not-found]
 
-    from pptx import Presentation  # type: ignore
-
-    pptx_file = BytesIO(file_bytes)
-    prs = Presentation(pptx_file)
-    content = ''
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, 'text'):
-                content += shape.text + '\n'  # type: ignore
-    return content
+    result = extract_file_sync(str(file_path))
+    return result.content
 
 
-def _extract_xlsx(file_bytes: bytes) -> str:
-    """Extract XLSX content in tab-delimited format with clear sheet separation.
-
-    This function processes Excel workbooks and converts them to a structured text format
-    suitable for LLM prompts and RAG systems. Each sheet is clearly delimited with
-    separator lines, and special characters are escaped to preserve the tab-delimited structure.
-
-    Features:
-    - Each sheet is wrapped with '====================' separators for visual distinction
-    - Special characters (tabs, newlines, backslashes) are escaped to prevent structure corruption
-    - Column alignment is preserved across all rows to maintain tabular structure
-    - Empty rows are preserved as blank lines to maintain row structure
-    - Uses sheet.max_column to determine column width efficiently
-
-    Args:
-        file_bytes: XLSX file content as bytes
-
-    Returns:
-        str: Extracted text content with all sheets in tab-delimited format.
-             Format: Sheet separators, sheet name, then tab-delimited rows.
-
-    Example output:
-        ==================== Sheet: Data ====================
-        Name\tAge\tCity
-        Alice\t30\tNew York
-        Bob\t25\tLondon
-
-        ==================== Sheet: Summary ====================
-        Total\t2
-        ====================
-    """
-    from openpyxl import load_workbook  # type: ignore
-
-    xlsx_file = BytesIO(file_bytes)
-    wb = load_workbook(xlsx_file)
-
-    def escape_cell(cell_value: object | None) -> str:
-        """Escape characters that would break tab-delimited layout.
-
-        Escape order is critical: backslashes first, then tabs/newlines.
-        This prevents double-escaping issues.
-
-        Args:
-            cell_value: The cell value to escape (can be None, str, int, or float)
-
-        Returns:
-            str: Escaped cell value safe for tab-delimited format
-        """
-        if cell_value is None:
-            return ''
-        text = str(cell_value)
-        # CRITICAL: Escape backslash first to avoid double-escaping
-        return (
-            text.replace('\\', '\\\\')  # Must be first: \ -> \\
-            .replace('\t', '\\t')  # Tab -> \t (visible)
-            .replace('\r\n', '\\n')  # Windows newline -> \n
-            .replace('\r', '\\n')  # Mac newline -> \n
-            .replace('\n', '\\n')  # Unix newline -> \n
-        )
-
-    def escape_sheet_title(title: str) -> str:
-        """Escape sheet title to prevent formatting issues in separators.
-
-        Args:
-            title: Original sheet title
-
-        Returns:
-            str: Sanitized sheet title with tabs/newlines replaced
-        """
-        return str(title).replace('\n', ' ').replace('\t', ' ').replace('\r', ' ')
-
-    content_parts: list[str] = []
-    sheet_separator = '=' * 20
-
-    for idx, sheet in enumerate(wb):
-        if idx > 0:
-            content_parts.append('')  # Blank line between sheets for readability
-
-        # Escape sheet title to handle edge cases with special characters
-        safe_title = escape_sheet_title(sheet.title)
-        content_parts.append(f'{sheet_separator} Sheet: {safe_title} {sheet_separator}')
-
-        # Use sheet.max_column to get the maximum column width directly
-        max_columns = sheet.max_column if sheet.max_column else 0
-
-        # Extract rows with consistent width to preserve column alignment
-        for row in sheet.iter_rows(values_only=True):
-            row_parts = []
-
-            # Build row up to max_columns width
-            for idx in range(max_columns):
-                if idx < len(row):
-                    row_parts.append(escape_cell(row[idx]))
-                else:
-                    row_parts.append('')  # Pad short rows
-
-            # Check if row is completely empty
-            if all(part == '' for part in row_parts):
-                # Preserve empty rows as blank lines (maintains row structure)
-                content_parts.append('')
-            else:
-                # Join all columns to maintain consistent column count
-                content_parts.append('\t'.join(row_parts))
-
-    # Final separator for symmetry (makes parsing easier)
-    content_parts.append(sheet_separator)
-    return '\n'.join(content_parts)
-
-
-async def pipeline_enqueue_file(rag: LightRAG, file_path: Path, track_id: str | None = None) -> tuple[bool, str]:
+async def pipeline_enqueue_file(
+    rag: LightRAG,
+    file_path: Path,
+    track_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
         track_id: Optional tracking ID, if not provided will be generated
+        metadata: Optional metadata dict (e.g., chunking_preset)
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -1312,108 +1004,21 @@ async def pipeline_enqueue_file(rag: LightRAG, file_path: Path, track_id: str | 
                         )
                         return False, track_id
 
-                case '.pdf':
+                case '.pdf' | '.docx' | '.pptx' | '.xlsx':
+                    # Use Kreuzberg for all document formats (56+ supported)
                     try:
-                        # Try DOCLING first if configured and available
-                        if global_args.document_loading_engine == 'DOCLING' and _is_docling_available():
-                            content = await asyncio.to_thread(_convert_with_docling, file_path)
-                        else:
-                            if global_args.document_loading_engine == 'DOCLING' and not _is_docling_available():
-                                logger.warning(
-                                    f'DOCLING engine configured but not available for {file_path.name}. Falling back to pypdf.'
-                                )
-                            # Use pypdf (non-blocking via to_thread)
-                            content = await asyncio.to_thread(
-                                _extract_pdf_pypdf,
-                                file,
-                                global_args.pdf_decrypt_password,
-                            )
+                        content = await asyncio.to_thread(_convert_with_kreuzberg, file_path)
                     except Exception as e:
                         error_files = [
                             {
                                 'file_path': str(file_path.name),
-                                'error_description': '[File Extraction]PDF processing error',
-                                'original_error': f'Failed to extract text from PDF: {e!s}',
+                                'error_description': f'[File Extraction]{ext.upper()[1:]} processing error',
+                                'original_error': f'Failed to extract text: {e!s}',
                                 'file_size': file_size,
                             }
                         ]
                         await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                        logger.error(f'[File Extraction]Error processing PDF {file_path.name}: {e!s}')
-                        return False, track_id
-
-                case '.docx':
-                    try:
-                        # Try DOCLING first if configured and available
-                        if global_args.document_loading_engine == 'DOCLING' and _is_docling_available():
-                            content = await asyncio.to_thread(_convert_with_docling, file_path)
-                        else:
-                            if global_args.document_loading_engine == 'DOCLING' and not _is_docling_available():
-                                logger.warning(
-                                    f'DOCLING engine configured but not available for {file_path.name}. Falling back to python-docx.'
-                                )
-                            # Use python-docx (non-blocking via to_thread)
-                            content = await asyncio.to_thread(_extract_docx, file)
-                    except Exception as e:
-                        error_files = [
-                            {
-                                'file_path': str(file_path.name),
-                                'error_description': '[File Extraction]DOCX processing error',
-                                'original_error': f'Failed to extract text from DOCX: {e!s}',
-                                'file_size': file_size,
-                            }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                        logger.error(f'[File Extraction]Error processing DOCX {file_path.name}: {e!s}')
-                        return False, track_id
-
-                case '.pptx':
-                    try:
-                        # Try DOCLING first if configured and available
-                        if global_args.document_loading_engine == 'DOCLING' and _is_docling_available():
-                            content = await asyncio.to_thread(_convert_with_docling, file_path)
-                        else:
-                            if global_args.document_loading_engine == 'DOCLING' and not _is_docling_available():
-                                logger.warning(
-                                    f'DOCLING engine configured but not available for {file_path.name}. Falling back to python-pptx.'
-                                )
-                            # Use python-pptx (non-blocking via to_thread)
-                            content = await asyncio.to_thread(_extract_pptx, file)
-                    except Exception as e:
-                        error_files = [
-                            {
-                                'file_path': str(file_path.name),
-                                'error_description': '[File Extraction]PPTX processing error',
-                                'original_error': f'Failed to extract text from PPTX: {e!s}',
-                                'file_size': file_size,
-                            }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                        logger.error(f'[File Extraction]Error processing PPTX {file_path.name}: {e!s}')
-                        return False, track_id
-
-                case '.xlsx':
-                    try:
-                        # Try DOCLING first if configured and available
-                        if global_args.document_loading_engine == 'DOCLING' and _is_docling_available():
-                            content = await asyncio.to_thread(_convert_with_docling, file_path)
-                        else:
-                            if global_args.document_loading_engine == 'DOCLING' and not _is_docling_available():
-                                logger.warning(
-                                    f'DOCLING engine configured but not available for {file_path.name}. Falling back to openpyxl.'
-                                )
-                            # Use openpyxl (non-blocking via to_thread)
-                            content = await asyncio.to_thread(_extract_xlsx, file)
-                    except Exception as e:
-                        error_files = [
-                            {
-                                'file_path': str(file_path.name),
-                                'error_description': '[File Extraction]XLSX processing error',
-                                'original_error': f'Failed to extract text from XLSX: {e!s}',
-                                'file_size': file_size,
-                            }
-                        ]
-                        await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                        logger.error(f'[File Extraction]Error processing XLSX {file_path.name}: {e!s}')
+                        logger.error(f'[File Extraction]Error processing {file_path.name}: {e!s}')
                         return False, track_id
 
                 case _:
@@ -1459,7 +1064,9 @@ async def pipeline_enqueue_file(rag: LightRAG, file_path: Path, track_id: str | 
                 return False, track_id
 
             try:
-                await rag.apipeline_enqueue_documents(content, file_paths=file_path.name, track_id=track_id)
+                await rag.apipeline_enqueue_documents(
+                    content, file_paths=file_path.name, track_id=track_id, metadata=metadata
+                )
 
                 logger.info(f'Successfully extracted and enqueued file: {file_path.name}')
 
@@ -1534,16 +1141,22 @@ async def pipeline_enqueue_file(rag: LightRAG, file_path: Path, track_id: str | 
                 logger.error(f'Error deleting file {file_path}: {e!s}')
 
 
-async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str | None = None):
+async def pipeline_index_file(
+    rag: LightRAG,
+    file_path: Path,
+    track_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+):
     """Index a file with track_id
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
         track_id: Optional tracking ID
+        metadata: Optional metadata dict (e.g., chunking_preset)
     """
     try:
-        success, _returned_track_id = await pipeline_enqueue_file(rag, file_path, track_id)
+        success, _returned_track_id = await pipeline_enqueue_file(rag, file_path, track_id, metadata)
         if success:
             await rag.apipeline_process_enqueue_documents()
 
@@ -1895,6 +1508,10 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
     async def upload_to_input_dir(
         background_tasks: BackgroundTasks,
         file: Annotated[UploadFile, File(...)],
+        chunking_preset: Annotated[
+            str | None,
+            Form(description="Chunking preset: 'semantic' (default), 'recursive', or empty for basic"),
+        ] = None,
     ):
         """
         Upload a file to the input directory and index it.
@@ -1906,6 +1523,9 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
         Args:
             background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension.
+            chunking_preset: Chunking strategy - 'semantic' (preserves meaning), 'recursive'
+                (splits by paragraphs/sentences/words), or None for basic chunking.
+                If not specified, uses the server default (CHUNKING_PRESET env var).
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -1955,8 +1575,11 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
 
             track_id = generate_track_id('upload')
 
+            # Build metadata with chunking preset if specified
+            metadata = {'chunking_preset': chunking_preset} if chunking_preset else None
+
             # Add to background tasks and get track_id
-            background_tasks.add_task(pipeline_index_file, rag, file_path, track_id)
+            background_tasks.add_task(pipeline_index_file, rag, file_path, track_id, metadata)
 
             return InsertResponse(
                 status='success',
@@ -2383,105 +2006,6 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
             return PipelineStatusResponse(**status_dict)
         except Exception as e:
             logger.error(f'Error getting pipeline status: {e!s}')
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e)) from e
-
-    # TODO: Deprecated, use /documents/paginated instead
-    @router.get('', response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)])
-    async def documents() -> DocsStatusesResponse:
-        """
-        Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
-        To prevent excessive resource consumption, a maximum of 1,000 records is returned.
-
-        This endpoint retrieves the current status of all documents, grouped by their
-        processing status (PENDING, PROCESSING, PREPROCESSED, PROCESSED, FAILED). The results are
-        limited to 1000 total documents with fair distribution across all statuses.
-
-        Returns:
-            DocsStatusesResponse: A response object containing a dictionary where keys are
-                                DocStatus values and values are lists of DocStatusResponse
-                                objects representing documents in each status category.
-                                Maximum 1000 documents total will be returned.
-
-        Raises:
-            HTTPException: If an error occurs while retrieving document statuses (500).
-        """
-        try:
-            statuses = (
-                DocStatus.PENDING,
-                DocStatus.PROCESSING,
-                DocStatus.PREPROCESSED,
-                DocStatus.PROCESSED,
-                DocStatus.FAILED,
-            )
-
-            tasks = [rag.get_docs_by_status(status) for status in statuses]
-            results: list[dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
-
-            response = DocsStatusesResponse()
-            total_documents = 0
-            max_documents = 1000
-
-            # Convert results to lists for easier processing
-            status_documents = []
-            for idx, result in enumerate(results):
-                status = statuses[idx]
-                docs_list = []
-                for doc_id, doc_status in result.items():
-                    docs_list.append((doc_id, doc_status))
-                status_documents.append((status, docs_list))
-
-            # Fair distribution: round-robin across statuses
-            status_indices = [0] * len(status_documents)  # Track current index for each status
-            current_status_idx = 0
-
-            while total_documents < max_documents:
-                # Check if we have any documents left to process
-                has_remaining = False
-                for status_idx, (_status, docs_list) in enumerate(status_documents):
-                    if status_indices[status_idx] < len(docs_list):
-                        has_remaining = True
-                        break
-
-                if not has_remaining:
-                    break
-
-                # Try to get a document from the current status
-                status, docs_list = status_documents[current_status_idx]
-                current_index = status_indices[current_status_idx]
-
-                if current_index < len(docs_list):
-                    doc_id, doc_status = docs_list[current_index]
-
-                    if status not in response.statuses:
-                        response.statuses[status] = []
-
-                    response.statuses[status].append(
-                        DocStatusResponse(
-                            id=doc_id,
-                            content_summary=doc_status.content_summary,
-                            content_length=doc_status.content_length,
-                            status=doc_status.status,
-                            created_at=format_datetime(doc_status.created_at),
-                            updated_at=format_datetime(doc_status.updated_at),
-                            track_id=doc_status.track_id,
-                            chunks_count=doc_status.chunks_count,
-                            error_msg=doc_status.error_msg,
-                            metadata=doc_status.metadata,
-                            file_path=doc_status.file_path,
-                            s3_key=doc_status.s3_key,
-                        )
-                    )
-
-                    status_indices[current_status_idx] += 1
-                    total_documents += 1
-
-                # Move to next status (round-robin)
-                current_status_idx = (current_status_idx + 1) % len(status_documents)
-
-            return response
-        except Exception as e:
-            logger.error(f'Error GET /documents: {e!s}')
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e)) from e
 

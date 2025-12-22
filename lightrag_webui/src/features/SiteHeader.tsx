@@ -1,5 +1,6 @@
 import { BrainIcon, LogOutIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import type { LightragConfiguration } from '@/api/lightrag'
 import AppSettings from '@/components/AppSettings'
 import StatusIndicator from '@/components/status/StatusIndicator'
 import Button from '@/components/ui/Button'
@@ -31,23 +32,20 @@ function NavigationTab({ value, currentTab, children }: NavigationTabProps) {
   )
 }
 
-function shouldShowTableExplorer() {
-  // Always show for now - TODO: fix storageConfig state propagation from health check
-  return true
-
-  // Original logic (storageConfig not being populated from health endpoint):
-  // if (import.meta.env.DEV) return true
-  // return (
-  //   storageConfig &&
-  //   storageConfig.kv_storage === 'PGKVStorage' &&
-  //   storageConfig.doc_status_storage === 'PGDocStatusStorage' &&
-  //   storageConfig.graph_storage === 'PGGraphStorage' &&
-  //   storageConfig.vector_storage === 'PGVectorStorage'
-  // )
+function shouldShowTableExplorer(storageConfig: Partial<LightragConfiguration> | null) {
+  if (import.meta.env.DEV) return true
+  return (
+    storageConfig &&
+    storageConfig.kv_storage === 'PGKVStorage' &&
+    storageConfig.doc_status_storage === 'PGDocStatusStorage' &&
+    storageConfig.graph_storage === 'PGGraphStorage' &&
+    storageConfig.vector_storage === 'PGVectorStorage'
+  )
 }
 
 function TabsNavigation() {
   const currentTab = useSettingsStore.use.currentTab()
+  const storageConfig = useSettingsStore.use.storageConfig()
   const { t } = useTranslation()
 
   return (
@@ -65,7 +63,7 @@ function TabsNavigation() {
         <NavigationTab value="api" currentTab={currentTab}>
           {t('header.api')}
         </NavigationTab>
-        {shouldShowTableExplorer() && (
+        {shouldShowTableExplorer(storageConfig) && (
           <NavigationTab value="table-explorer" currentTab={currentTab}>
             {t('header.tables')}
           </NavigationTab>

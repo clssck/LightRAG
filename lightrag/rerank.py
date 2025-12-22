@@ -12,7 +12,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from .utils import logger
+from .utils import TiktokenTokenizer, logger
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -62,8 +62,6 @@ def chunk_documents_for_rerank(
         )
 
     try:
-        from .utils import TiktokenTokenizer
-
         tokenizer = TiktokenTokenizer(model_name=tokenizer_model)
     except Exception as e:
         logger.warning(f'Failed to initialize tokenizer: {e}. Using character-based approximation.')

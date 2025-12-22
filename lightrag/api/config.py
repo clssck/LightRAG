@@ -17,7 +17,6 @@ from lightrag.constants import (
     DEFAULT_EMBEDDING_FUNC_MAX_ASYNC,
     DEFAULT_ENTITY_TYPES,
     DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
-    DEFAULT_HISTORY_TURNS,
     DEFAULT_MAX_ASYNC,
     DEFAULT_MAX_ENTITY_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
@@ -258,13 +257,6 @@ def parse_args() -> argparse.Namespace:
         help='Disable reranking (overrides --enable-rerank)',
     )
 
-    # Document loading engine configuration
-    parser.add_argument(
-        '--docling',
-        action='store_true',
-        default=False,
-        help='Enable DOCLING document loading engine (default: from env or DEFAULT)',
-    )
 
     # Conditionally add binding options defined in binding_options module
     # This will add command line arguments for all binding options (e.g., --ollama-embedding-num_ctx)
@@ -320,7 +312,7 @@ def parse_args() -> argparse.Namespace:
     elif os.environ.get('LLM_BINDING') == 'gemini':
         GeminiLLMOptions.add_args(parser)
 
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     # convert relative path to absolute path
     args.working_dir = os.path.abspath(args.working_dir)
@@ -364,16 +356,27 @@ def parse_args() -> argparse.Namespace:
     # Inject chunk configuration
     args.chunk_size = get_env_value('CHUNK_SIZE', 1200, int)
     args.chunk_overlap_size = get_env_value('CHUNK_OVERLAP_SIZE', 100, int)
+    # Chunking preset: 'semantic' (default), 'recursive', or empty/None (basic)
+    chunking_preset_value = get_env_value('CHUNKING_PRESET', 'semantic')
+    # Normalize and validate preset
+    if chunking_preset_value:
+        chunking_preset_value = chunking_preset_value.strip().lower()
+        if chunking_preset_value in ('none', ''):
+            chunking_preset_value = None
+        elif chunking_preset_value not in ('semantic', 'recursive'):
+            raise ValueError(
+                f"Invalid CHUNKING_PRESET '{chunking_preset_value}'. "
+                "Allowed values: 'semantic', 'recursive', 'none', or empty string."
+            )
+    args.chunking_preset = chunking_preset_value
 
     # Inject LLM cache configuration
     args.enable_llm_cache_for_extract = get_env_value('ENABLE_LLM_CACHE_FOR_EXTRACT', True, bool)
     args.enable_llm_cache = get_env_value('ENABLE_LLM_CACHE', True, bool)
 
-    # Set document_loading_engine from --docling flag
-    if args.docling:
-        args.document_loading_engine = 'DOCLING'
-    else:
-        args.document_loading_engine = get_env_value('DOCUMENT_LOADING_ENGINE', 'DEFAULT')
+    # Set document_loading_engine from env var
+    # Kreuzberg is the default and primary engine (56+ format support, Rust core)
+    args.document_loading_engine = get_env_value('DOCUMENT_LOADING_ENGINE', 'KREUZBERG')
 
     # PDF decryption password
     args.pdf_decrypt_password = get_env_value('PDF_DECRYPT_PASSWORD', None)
@@ -404,7 +407,6 @@ def parse_args() -> argparse.Namespace:
     args.auto_connect_orphans = get_env_value('AUTO_CONNECT_ORPHANS', False, bool)
 
     # Query configuration
-    args.history_turns = get_env_value('HISTORY_TURNS', DEFAULT_HISTORY_TURNS, int)
     args.top_k = get_env_value('TOP_K', DEFAULT_TOP_K, int)
     args.chunk_top_k = get_env_value('CHUNK_TOP_K', DEFAULT_CHUNK_TOP_K, int)
     args.max_entity_tokens = get_env_value('MAX_ENTITY_TOKENS', DEFAULT_MAX_ENTITY_TOKENS, int)

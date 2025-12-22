@@ -4,35 +4,11 @@ This module tests the BM25 full-text search endpoint using httpx AsyncClient
 and FastAPI's TestClient pattern with mocked PostgreSQLDB.
 """
 
-import sys
+# Import FastAPI components
+from typing import Annotated, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-# Mock the config module BEFORE importing search_routes to prevent
-# argparse from trying to parse pytest arguments as server arguments
-mock_global_args = MagicMock()
-mock_global_args.token_secret = 'test-secret'
-mock_global_args.jwt_secret_key = 'test-jwt-secret'
-mock_global_args.jwt_algorithm = 'HS256'
-mock_global_args.jwt_expire_hours = 24
-mock_global_args.username = None
-mock_global_args.password = None
-mock_global_args.guest_token = None
-
-# Pre-populate sys.modules with mocked config
-mock_config_module = MagicMock()
-mock_config_module.global_args = mock_global_args
-sys.modules['lightrag.api.config'] = mock_config_module
-
-# Also mock the auth module to prevent initialization issues
-mock_auth_module = MagicMock()
-mock_auth_module.auth_handler = MagicMock()
-sys.modules['lightrag.api.auth'] = mock_auth_module
-
-# Now import FastAPI components (after mocking)
-from typing import Annotated, Any
-
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, Field

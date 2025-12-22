@@ -89,6 +89,14 @@
       "tooltip": "上传文档",
       "title": "上传文档",
       "description": "拖拽文件到此处或点击浏览",
+      "advancedOptions": "高级选项",
+      "chunkingPreset": {
+        "label": "分块策略",
+        "semantic": "语义分块（推荐）",
+        "recursive": "递归分块",
+        "basic": "基础分块",
+        "description": "文档分块处理的方式"
+      },
       "single": {
         "uploading": "正在上传 {{name}}：{{percent}}%",
         "success": "上传成功：\n{{name}} 上传完成",

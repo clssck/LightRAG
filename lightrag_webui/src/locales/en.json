@@ -90,6 +90,14 @@
       "tooltip": "Upload documents",
       "title": "Upload Documents",
       "description": "Drag and drop your documents here or click to browse.",
+      "advancedOptions": "Advanced Options",
+      "chunkingPreset": {
+        "label": "Chunking Strategy",
+        "semantic": "Semantic (recommended)",
+        "recursive": "Recursive",
+        "basic": "Basic",
+        "description": "How documents are split into chunks for processing"
+      },
       "single": {
         "uploading": "Uploading {{name}}: {{percent}}%",
         "success": "Upload Success:\n{{name}} uploaded successfully",

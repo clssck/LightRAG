@@ -96,9 +96,9 @@ def select_canonical_entity(
         return entities[0]
 
     if strategy == 'longest':
-        return max(entities, key=len)
+        return max(entities, key=lambda entity: len(entity))
     elif strategy == 'shortest':
-        return min(entities, key=len)
+        return min(entities, key=lambda entity: len(entity))
     elif strategy == 'most_connected' and entity_degrees:
         return max(entities, key=lambda e: entity_degrees.get(e, 0))
     else:  # 'first' or fallback

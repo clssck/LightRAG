@@ -8,7 +8,7 @@ This module provides endpoints for:
 """
 
 import mimetypes
-from typing import Annotated, Any, ClassVar
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -18,7 +18,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lightrag import LightRAG
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -36,8 +36,8 @@ class UploadResponse(BaseModel):
     s3_url: str = Field(description='S3 URL (s3://bucket/key)')
     message: str | None = Field(default=None, description='Additional message')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'uploaded',
                 'doc_id': 'doc_abc123',
@@ -46,6 +46,7 @@ class UploadResponse(BaseModel):
                 'message': 'Document staged for processing',
             }
         }
+    )
 
 
 class StagedDocument(BaseModel):
@@ -85,14 +86,15 @@ class ProcessS3Request(BaseModel):
         description='Move document to archive after successful processing',
     )
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 's3_key': 'staging/default/doc_abc123/report.pdf',
                 'doc_id': 'doc_abc123',
                 'archive_after_processing': True,
             }
         }
+    )
 
 
 class ProcessS3Response(BaseModel):
@@ -105,8 +107,8 @@ class ProcessS3Response(BaseModel):
     archive_key: str | None = Field(default=None, description='Archive S3 key (if archived)')
     message: str | None = Field(default=None, description='Additional message')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'status': 'processing_started',
                 'track_id': 'insert_20250101_120000_abc123',
@@ -116,6 +118,7 @@ class ProcessS3Response(BaseModel):
                 'message': 'Document processing started',
             }
         }
+    )
 
 
 def create_upload_routes(

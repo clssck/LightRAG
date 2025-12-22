@@ -293,7 +293,9 @@ class TestConfigPropagation:
         }
 
         # Verify we can reconstruct the config
-        reconstructed = EntityResolutionConfig(**global_config['entity_resolution_config'])
+        config_payload = global_config['entity_resolution_config']
+        assert isinstance(config_payload, dict)
+        reconstructed = EntityResolutionConfig(**config_payload)
 
         assert reconstructed.enabled is True
         assert reconstructed.fuzzy_threshold == 0.9

@@ -75,7 +75,7 @@ class TestRunClusteringBackground:
             mock_status.return_value = status_dict
             mock_lock.return_value = MockLock()
 
-            await _run_clustering_background(mock_rag, 0.85, 2, False)
+            await _run_clustering_background(mock_rag, 0.85, 2, False, llm_verify=False, auto_merge=False)
 
             # Check that status was initialized
             assert status_dict.get('job_name') == 'Entity Clustering'
@@ -96,7 +96,7 @@ class TestRunClusteringBackground:
             mock_status.return_value = status_dict
             mock_lock.return_value = MockLock()
 
-            await _run_clustering_background(mock_rag, 0.85, 2, False)
+            await _run_clustering_background(mock_rag, 0.85, 2, False, llm_verify=False, auto_merge=False)
 
             # Should complete and indicate no entities
             assert status_dict.get('busy') is False
@@ -128,7 +128,7 @@ class TestRunClusteringBackground:
             mock_lock.return_value = MockLock()
             mock_cluster.return_value = mock_result
 
-            await _run_clustering_background(mock_rag, 0.85, 2, False)
+            await _run_clustering_background(mock_rag, 0.85, 2, False, llm_verify=False, auto_merge=False)
 
             # Verify cluster_entities_batch was called with parsed entities
             mock_cluster.assert_called_once()
@@ -240,7 +240,7 @@ class TestRunClusteringBackground:
             mock_lock.return_value = MockLock()
             mock_cluster.return_value = mock_result
 
-            await _run_clustering_background(mock_rag, 0.85, 2, dry_run=True)
+            await _run_clustering_background(mock_rag, 0.85, 2, dry_run=True, llm_verify=False, auto_merge=False)
 
             # process_clustering_results should NOT be called in dry run
             mock_process.assert_not_called()
@@ -282,7 +282,7 @@ class TestRunClusteringBackground:
             mock_cluster.return_value = mock_result
             mock_process.return_value = {'clusters': 1, 'aliases_stored': 1}
 
-            await _run_clustering_background(mock_rag, 0.85, 2, dry_run=False)
+            await _run_clustering_background(mock_rag, 0.85, 2, dry_run=False, llm_verify=False, auto_merge=False)
 
             # process_clustering_results should be called
             mock_process.assert_called_once()
@@ -305,7 +305,7 @@ class TestRunClusteringBackground:
             mock_lock.return_value = MockLock()
 
             # Should not raise
-            await _run_clustering_background(mock_rag, 0.85, 2, False)
+            await _run_clustering_background(mock_rag, 0.85, 2, False, llm_verify=False, auto_merge=False)
 
             # Status should indicate error
             assert 'error' in status_dict.get('latest_message', '').lower()
@@ -338,7 +338,7 @@ class TestRunClusteringBackground:
             mock_lock.return_value = MockLock()
             mock_cluster.return_value = mock_result
 
-            await _run_clustering_background(mock_rag, 0.85, 2, False)
+            await _run_clustering_background(mock_rag, 0.85, 2, False, llm_verify=False, auto_merge=False)
 
             # Should have updated total_items and processed_items
             assert status_dict.get('total_items') == 3
@@ -369,7 +369,7 @@ class TestRunClusteringBackground:
             mock_lock.return_value = MockLock()
             mock_cluster.return_value = mock_result
 
-            await _run_clustering_background(mock_rag, 0.92, 3, False)
+            await _run_clustering_background(mock_rag, 0.92, 3, False, llm_verify=False, auto_merge=False)
 
             # Verify config was passed correctly
             mock_cluster.assert_called_once()
@@ -405,7 +405,7 @@ class TestRunClusteringBackground:
             mock_lock.return_value = MockLock()
             mock_cluster.return_value = mock_result
 
-            await _run_clustering_background(mock_rag, 0.85, 2, False)
+            await _run_clustering_background(mock_rag, 0.85, 2, False, llm_verify=False, auto_merge=False)
 
             # Should only pass 2 valid entities
             entities = mock_cluster.call_args[0][0]

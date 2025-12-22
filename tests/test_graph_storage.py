@@ -240,7 +240,7 @@ async def test_graph_advanced(storage):
     1. Use node_degree to get the degree of a node.
     2. Use edge_degree to get the degree of an edge.
     3. Use get_node_edges to get all edges of a node.
-    4. Use get_all_labels to get all labels.
+    4. Use get_all_nodes to get all labels.
     5. Use get_knowledge_graph to get a knowledge graph.
     6. Use delete_node to delete a node.
     7. Use remove_nodes to delete multiple nodes.
@@ -355,9 +355,11 @@ async def test_graph_advanced(storage):
             f'Undirected graph property verification successful: edge list of node {node2_id} contains all relevant edges'
         )
 
-        # 5. Test get_all_labels - get all labels
-        print('== Testing get_all_labels')
-        all_labels = await storage.get_all_labels()
+        # 5. Test get_all_nodes - get all node labels
+        print('== Testing get_all_nodes')
+        all_nodes = await storage.get_all_nodes()
+        all_labels = [node.get('entity_id') or node.get('id') for node in all_nodes]
+        all_labels = [label for label in all_labels if label]
         print(f'All labels: {all_labels}')
         assert len(all_labels) == 3, f'Should have 3 labels, but got {len(all_labels)}'
         assert node1_id in all_labels, f'{node1_id} should be in the label list'

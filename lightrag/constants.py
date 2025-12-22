@@ -53,9 +53,6 @@ DEFAULT_COSINE_THRESHOLD = 0.30  # Lowered from 0.35 to retrieve more related co
 DEFAULT_RELATED_CHUNK_NUMBER = 16  # Increased from 12 to improve context recall
 DEFAULT_KG_CHUNK_PICK_METHOD = 'VECTOR'
 
-# TODO: Deprated. All conversation_history messages is send to LLM.
-DEFAULT_HISTORY_TURNS = 0
-
 # Rerank configuration defaults
 # Local reranking uses mxbai-rerank-xsmall-v1 by default (see rerank.py)
 DEFAULT_ENABLE_RERANK = True

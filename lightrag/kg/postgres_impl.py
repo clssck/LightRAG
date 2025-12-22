@@ -2696,7 +2696,8 @@ class PGVectorStorage(BaseVectorStorage):
             embeddings = await self.embedding_func([query], _priority=5)  # higher priority for query
             embedding = embeddings[0]
 
-        embedding_string = ','.join(map(str, embedding))
+        embedding_values = [float(value) for value in embedding]
+        embedding_string = ','.join(str(value) for value in embedding_values)
 
         sql = SQL_TEMPLATES[self.namespace].format(embedding_string=embedding_string)
         params = {
@@ -5062,29 +5063,6 @@ class PGGraphStorage(BaseGraphStorage):
             out[orig] = edges_norm.get(n, [])
 
         return out
-
-    async def get_all_labels(self) -> list[str]:
-        """
-        Get all labels (node IDs) in the graph.
-
-        Returns:
-            list[str]: A list of all labels in the graph.
-        """
-        # Use native SQL for better performance
-        query = f"""
-            SELECT DISTINCT
-                (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"entity_id"'::agtype]))::text AS label
-            FROM {self.graph_name}.base
-            WHERE ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"entity_id"'::agtype]) IS NOT NULL
-            ORDER BY label
-        """
-
-        results = await self._query(query)
-        labels = []
-        for result in results:
-            if result and isinstance(result, dict) and 'label' in result:
-                labels.append(result['label'])
-        return labels
 
     async def _bfs_subgraph(self, node_label: str, max_depth: int | None, max_nodes: int | None) -> KnowledgeGraph:
         """

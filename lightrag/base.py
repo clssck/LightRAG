@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 from .constants import (
     DEFAULT_CHECK_TOPIC_CONNECTIVITY,
     DEFAULT_CHUNK_TOP_K,
-    DEFAULT_HISTORY_TURNS,
     DEFAULT_MAX_ENTITY_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
     DEFAULT_MAX_TOTAL_TOKENS,
@@ -135,15 +134,11 @@ class QueryParam:
     ll_keywords: list[str] = field(default_factory=list)
     """List of low-level keywords to refine retrieval focus."""
 
-    # History mesages is only send to LLM for context, not used for retrieval
+    # History messages are only sent to LLM for context, not used for retrieval
     conversation_history: list[dict[str, str]] = field(default_factory=list)
     """Stores past conversation history to maintain context.
     Format: [{"role": "user/assistant", "content": "message"}].
     """
-
-    # TODO: deprecated. No longer used in the codebase, all conversation_history messages is send to LLM
-    history_turns: int = int(os.getenv('HISTORY_TURNS', str(DEFAULT_HISTORY_TURNS)))
-    """Number of complete conversation turns (user-assistant pairs) to consider in the response context."""
 
     model_func: Callable[..., object] | None = None
     """Optional override for the LLM model function to use for this specific query.
@@ -747,15 +742,6 @@ class BaseGraphStorage(StorageNameSpace, ABC):
 
         Args:
             edges: List of edges to be deleted, each edge is a (source, target) tuple
-        """
-
-    # TODO: deprecated
-    @abstractmethod
-    async def get_all_labels(self) -> list[str]:
-        """Get all labels in the graph.
-
-        Returns:
-            A list of all node labels in the graph, sorted alphabetically
         """
 
     @abstractmethod

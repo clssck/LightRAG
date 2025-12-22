@@ -1471,11 +1471,14 @@ async def aexport_data(
     relationships_data = []
 
     # --- Entities ---
-    all_entities = await chunk_entity_relation_graph.get_all_labels()
-    for entity_name in all_entities:
-        # Get entity information from graph
-        node_data = await chunk_entity_relation_graph.get_node(entity_name)
-        source_id = node_data.get('source_id') if node_data else None
+    all_nodes = await chunk_entity_relation_graph.get_all_nodes()
+    all_entities = []
+    for node_data in all_nodes:
+        entity_name = node_data.get('entity_id') or node_data.get('id')
+        if not entity_name:
+            continue
+        all_entities.append(entity_name)
+        source_id = node_data.get('source_id')
 
         entity_info = {
             'graph_data': node_data,

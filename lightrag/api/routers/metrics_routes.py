@@ -9,10 +9,9 @@ Endpoints:
 - GET /metrics/queries: Recent query details
 """
 
-from typing import Any, ClassVar
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.cache.fts_cache import get_fts_cache_stats
@@ -72,8 +71,8 @@ class MetricsResponse(BaseModel):
     mode_distribution: dict[str, int] = Field(description='Query count by mode in the time window')
     legacy_stats: dict[str, int] = Field(description='Legacy statistics from utils.statistic_data')
 
-    class Config:
-        json_schema_extra: ClassVar[dict[str, Any]] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             'example': {
                 'uptime_seconds': 3600.5,
                 'total_queries': 150,
@@ -105,6 +104,7 @@ class MetricsResponse(BaseModel):
                 'legacy_stats': {'llm_call': 100, 'llm_cache': 50, 'embed_call': 200},
             }
         }
+    )
 
 
 class QueryMetricItem(BaseModel):

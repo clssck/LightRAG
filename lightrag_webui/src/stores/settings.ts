@@ -159,7 +159,6 @@ const useSettingsStoreBase = create<SettingsState>()(
         only_need_context: false,
         only_need_prompt: false,
         stream: true,
-        history_turns: 0,
         user_prompt: '',
         enable_rerank: true,
         citation_mode: 'none',
@@ -257,11 +256,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
 
       updateQuerySettings: (settings: Partial<QueryRequest>) => {
-        // Filter out history_turns to prevent changes, always keep it as 0
-        const filteredSettings = { ...settings }
-        delete filteredSettings.history_turns
         set((state) => ({
-          querySettings: { ...state.querySettings, ...filteredSettings, history_turns: 0 },
+          querySettings: { ...state.querySettings, ...settings },
         }))
       },
 
@@ -306,7 +302,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 24,
+      version: 25,
       migrate: (persistedState: unknown, version: number) => {
         // Cast to the expected state type for migration operations
         const state = persistedState as Partial<SettingsState> & Record<string, unknown>
@@ -336,7 +332,6 @@ const useSettingsStoreBase = create<SettingsState>()(
             only_need_context: false,
             only_need_prompt: false,
             stream: true,
-            history_turns: 0,
           } as Omit<QueryRequest, 'query'>
           state.retrievalHistory = []
         }
@@ -385,18 +380,11 @@ const useSettingsStoreBase = create<SettingsState>()(
             max_relation_tokens: 10000,
             max_total_tokens: 32000,
             enable_rerank: true,
-            history_turns: 0,
           }
         }
         if (version < 16) {
           // Add documentsPageSize field for older versions
           state.documentsPageSize = 10
-        }
-        if (version < 17) {
-          // Force history_turns to 0 for all users
-          if (state.querySettings) {
-            state.querySettings.history_turns = 0
-          }
         }
         if (version < 18) {
           // Add userPromptHistory field for older versions
@@ -435,6 +423,11 @@ const useSettingsStoreBase = create<SettingsState>()(
           if (state.querySettings) {
             state.querySettings.citation_mode = 'none'
             state.querySettings.citation_threshold = 0.7
+          }
+        }
+        if (version < 25) {
+          if (state.querySettings) {
+            delete state.querySettings.history_turns
           }
         }
         return state

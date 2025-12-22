@@ -33,21 +33,21 @@ from .resolver import (
 __all__ = [
     # Config
     'DEFAULT_CONFIG',
-    'EntityResolutionConfig',
     # Abbreviation detection
     'AbbreviationMatch',
-    'detect_abbreviation',
-    'find_abbreviation_match',
     # Clustering
     'ClusteringConfig',
     'ClusteringResult',
     'EntityCluster',
-    'cluster_entities_batch',
-    'process_clustering_results',
+    'EntityResolutionConfig',
     # Resolution
     'ResolutionResult',
+    'cluster_entities_batch',
+    'detect_abbreviation',
+    'find_abbreviation_match',
     'fuzzy_similarity',
     'get_cached_alias',
+    'process_clustering_results',
     'resolve_entity',
     'resolve_entity_with_vdb',
     'store_alias',

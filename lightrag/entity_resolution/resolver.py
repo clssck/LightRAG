@@ -159,12 +159,14 @@ async def resolve_entity(
     )
 
     # Verify top candidates with LLM
+    prompt_template = config.llm_prompt_template or DEFAULT_CONFIG.llm_prompt_template
+    assert prompt_template is not None
     for candidate_name, similarity in candidates[: config.max_candidates]:
         is_same = await llm_verify(
             entity_name,
             candidate_name,
             llm_fn,
-            config.llm_prompt_template,
+            prompt_template,
         )
         if is_same:
             return ResolutionResult('match', candidate_name, similarity, 'llm')
@@ -267,11 +269,13 @@ async def resolve_entity_with_vdb(
         if not candidate_name:
             continue
 
+        prompt_template = config.llm_prompt_template or DEFAULT_CONFIG.llm_prompt_template
+        assert prompt_template is not None
         is_same = await llm_verify(
             entity_name,
             candidate_name,
             llm_fn,
-            config.llm_prompt_template,
+            prompt_template,
         )
         verified_count += 1
 
