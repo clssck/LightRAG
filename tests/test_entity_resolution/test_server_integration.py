@@ -69,9 +69,9 @@ class TestRouteRegistrationApiKey:
         )
         source = server_file.read_text()
 
-        # Should find rerank_api_key for rerank bindings
-        assert 'rerank_api_key = os.getenv' in source or 'rerank_api_key=' in source, (
-            "Rerank setup should use 'rerank_api_key' variable name"
+        # Rerank uses factory pattern - configuration handled via create_rerank_func
+        assert 'create_rerank_func' in source, (
+            "Rerank setup should use create_rerank_func factory"
         )
 
 

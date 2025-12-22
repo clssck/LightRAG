@@ -6,8 +6,8 @@ for offline environments where internet access is not available.
 """
 
 import os
-import sys
 from pathlib import Path
+import sys
 
 
 def download_tiktoken_cache(cache_dir: str | None = None, models: list[str] | None = None):

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Callable
 from functools import partial
+import json
 from pathlib import Path
+import time
 from typing import Any, Literal, overload
 
-import json_repair
 from dotenv import load_dotenv
+import json_repair
 
 from lightrag.base import (
     BaseGraphStorage,
@@ -123,9 +123,7 @@ def chunking_by_semantic(
     try:
         from kreuzberg import ChunkingConfig, ExtractionConfig, extract_bytes_sync
     except ImportError:
-        raise ImportError(
-            'kreuzberg is not installed. Install with: pip install kreuzberg'
-        ) from None
+        raise ImportError('kreuzberg is not installed. Install with: pip install kreuzberg') from None
 
     # Build chunking config with optional preset
     chunking_kwargs: dict[str, Any] = {
@@ -135,9 +133,7 @@ def chunking_by_semantic(
     if preset:
         chunking_kwargs['preset'] = preset
 
-    config = ExtractionConfig(
-        chunking=ChunkingConfig(**chunking_kwargs)
-    )
+    config = ExtractionConfig(chunking=ChunkingConfig(**chunking_kwargs))
 
     # Kreuzberg expects bytes with MIME type for text
     result = extract_bytes_sync(
@@ -173,22 +169,26 @@ def chunking_by_semantic(
             # Estimate token count (~4 chars per token)
             tokens = len(chunk_content) // 4
 
-            results.append({
-                'tokens': tokens,
-                'content': chunk_content.strip(),
-                'chunk_order_index': index,
-                'char_start': max(0, char_start),
-                'char_end': char_end,
-            })
+            results.append(
+                {
+                    'tokens': tokens,
+                    'content': chunk_content.strip(),
+                    'chunk_order_index': index,
+                    'char_start': max(0, char_start),
+                    'char_end': char_end,
+                }
+            )
     else:
         # Fallback: return whole content as single chunk
-        results.append({
-            'tokens': len(content) // 4,
-            'content': content.strip(),
-            'chunk_order_index': 0,
-            'char_start': 0,
-            'char_end': len(content),
-        })
+        results.append(
+            {
+                'tokens': len(content) // 4,
+                'content': content.strip(),
+                'chunk_order_index': 0,
+                'char_start': 0,
+                'char_end': len(content),
+            }
+        )
 
     return results
 
@@ -223,6 +223,7 @@ def create_chunker(
         ...     chunking_func=create_chunker(preset='recursive')
         ... )
     """
+
     def semantic_chunking_adapter(
         tokenizer: Tokenizer | None,
         content: str,
@@ -2424,7 +2425,9 @@ async def _resolve_entity_aliases_for_batch(
         if new_src == new_tgt:
             logger.debug(f'[{workspace}] Skipping self-loop: {src}-{tgt} → {new_src}')
             continue
-        new_key = tuple(sorted([new_src, new_tgt]))
+        # Filter out None values before sorting to satisfy type checker
+        nodes_to_sort = [n for n in [new_src, new_tgt] if n is not None]
+        new_key = tuple(sorted(nodes_to_sort))
         new_all_edges[new_key].extend(edges)
 
     return dict(new_all_nodes), dict(new_all_edges)
@@ -3163,7 +3166,7 @@ async def kg_query(
         logger.info(' == LLM cache == Query cache hit, using cached response as query result')
         response = cached_response
     else:
-        response = await use_model_func(
+        response = await use_model_func(  # type: ignore[misc]
             user_query,
             system_prompt=sys_prompt,
             history_messages=query_param.conversation_history,
@@ -3303,7 +3306,7 @@ async def extract_keywords_only(
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    result = await use_model_func(kw_prompt, keyword_extraction=True)
+    result = await use_model_func(kw_prompt, keyword_extraction=True)  # type: ignore[misc]
 
     # 5. Parse out JSON from the LLM response
     result = remove_think_tags(result)
@@ -3409,7 +3412,9 @@ async def _get_vector_context(
                 valid_chunks.append(chunk_with_metadata)
 
         search_type = 'bm25_fusion' if query_param.enable_bm25_fusion else 'vector'
-        logger.info(f'Naive query ({search_type}): {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})')
+        logger.info(
+            f'Naive query ({search_type}): {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})'
+        )
         return valid_chunks
 
     except Exception as e:
@@ -3457,10 +3462,12 @@ async def _perform_kg_search(
             use_model_func = query_param.model_func or text_chunks_db.global_config.get('llm_model_func')
             if use_model_func:
                 hyde_prompt = PROMPTS['hyde_prompt'].format(query=query)
-                hypothetical_answer = await use_model_func(hyde_prompt)
+                hypothetical_answer = await use_model_func(hyde_prompt)  # type: ignore[misc]
                 if hypothetical_answer and isinstance(hypothetical_answer, str) and len(hypothetical_answer) > 20:
                     embedding_query_text = hypothetical_answer
-                    logger.debug(f'HyDE: Generated hypothetical answer ({len(hypothetical_answer)} chars) for embedding')
+                    logger.debug(
+                        f'HyDE: Generated hypothetical answer ({len(hypothetical_answer)} chars) for embedding'
+                    )
                 else:
                     logger.warning('HyDE: Generated answer too short, using original query')
             else:
@@ -4079,9 +4086,9 @@ async def _build_query_context(
 
         # Filter entities: keep those whose name or description contains the filter term
         filtered_entities = [
-            e for e in search_result['final_entities']
-            if filter_term in e.get('entity_name', '').lower()
-            or filter_term in e.get('description', '').lower()
+            e
+            for e in search_result['final_entities']
+            if filter_term in e.get('entity_name', '').lower() or filter_term in e.get('description', '').lower()
         ]
 
         # Get the set of filtered entity names for relation filtering
@@ -4089,9 +4096,12 @@ async def _build_query_context(
 
         # Filter relations: keep those connected to at least one filtered entity
         filtered_relations = [
-            r for r in search_result['final_relations']
-            if (r.get('src_tgt', ('', ''))[0].lower() in filtered_entity_names
-                or r.get('src_tgt', ('', ''))[1].lower() in filtered_entity_names)
+            r
+            for r in search_result['final_relations']
+            if (
+                r.get('src_tgt', ('', ''))[0].lower() in filtered_entity_names
+                or r.get('src_tgt', ('', ''))[1].lower() in filtered_entity_names
+            )
         ]
 
         # Update search_result with filtered data
@@ -4100,8 +4110,8 @@ async def _build_query_context(
 
         logger.info(
             f"Entity filter '{query_param.entity_filter}': "
-            f"{original_entity_count} → {len(filtered_entities)} entities, "
-            f"{original_relation_count} → {len(filtered_relations)} relations"
+            f'{original_entity_count} → {len(filtered_entities)} entities, '
+            f'{original_relation_count} → {len(filtered_relations)} relations'
         )
 
         # Return None if filter removed all results
@@ -4671,7 +4681,9 @@ async def _find_related_text_unit_from_relations(
             f'Selecting {len(selected_chunk_ids)} from {total_relation_chunks} relation-related chunks by weighted polling'
         )
 
-    logger.debug(f'KG related chunks: {len(entity_chunks) if entity_chunks else 0} from entitys, {len(selected_chunk_ids)} from relations')
+    logger.debug(
+        f'KG related chunks: {len(entity_chunks) if entity_chunks else 0} from entitys, {len(selected_chunk_ids)} from relations'
+    )
 
     if not selected_chunk_ids:
         return []
@@ -4773,7 +4785,7 @@ async def naive_query(
     if query_param.enable_hyde:
         try:
             hyde_prompt = PROMPTS['hyde_prompt'].format(query=query)
-            hypothetical_answer = await use_model_func(hyde_prompt)
+            hypothetical_answer = await use_model_func(hyde_prompt)  # type: ignore[misc]
             if hypothetical_answer and isinstance(hypothetical_answer, str) and len(hypothetical_answer) > 20:
                 embedding_func = getattr(chunks_vdb, 'embedding_func', None)
                 if embedding_func:
@@ -4918,7 +4930,7 @@ async def naive_query(
         logger.info(' == LLM cache == Query cache hit, using cached response as query result')
         response = cached_response
     else:
-        response = await use_model_func(
+        response = await use_model_func(  # type: ignore[misc]
             user_query,
             system_prompt=sys_prompt,
             history_messages=query_param.conversation_history,

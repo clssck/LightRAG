@@ -1,22 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
+from functools import partial
 import inspect
 import json
 import os
 import time
 import traceback
-import warnings
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from functools import partial
 from typing import (
     Any,
     Literal,
     cast,
     final,
 )
+import warnings
 
 from dotenv import load_dotenv
 
@@ -495,29 +495,35 @@ class LightRAG:
                 f'max_total_tokens({self.summary_max_tokens}) should greater than summary_length_recommended({self.summary_length_recommended})'
             )
 
-        # Fix global_config now
-        global_config = asdict(self)
-
-        _print_config = ',\n  '.join([f'{k} = {v}' for k, v in global_config.items()])
-        logger.debug(f'LightRAG init with param:\n  {_print_config}\n')
-
         # Init Embedding
-        # Step 1: Capture max_token_size before applying decorator (decorator strips dataclass attributes)
+        # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
+        original_embedding_func = self.embedding_func
         embedding_max_token_size = None
         if self.embedding_func and hasattr(self.embedding_func, 'max_token_size'):
             embedding_max_token_size = self.embedding_func.max_token_size
             logger.debug(f'Captured embedding max_token_size: {embedding_max_token_size}')
         self.embedding_token_limit = embedding_max_token_size
 
-        # Step 2: Apply priority wrapper decorator when an embedding function is provided
+        # Fix global_config now
+        global_config = asdict(self)
+        # Restore original EmbeddingFunc object (asdict converts it to dict)
+        global_config['embedding_func'] = original_embedding_func
+
+        _print_config = ',\n  '.join([f'{k} = {v}' for k, v in global_config.items()])
+        logger.debug(f'LightRAG init with param:\n  {_print_config}\n')
+
+        # Step 2: Apply priority wrapper decorator to EmbeddingFunc's inner func
+        # Create a NEW EmbeddingFunc instance with the wrapped func to avoid mutating the caller's object
+        # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
+        # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
         if self.embedding_func is not None:
-            wrapped = priority_limit_async_func_call(
+            wrapped_func = priority_limit_async_func_call(
                 self.embedding_func_max_async,
                 llm_timeout=self.default_embedding_timeout,
                 queue_name='Embedding func',
-            )(self.embedding_func)
-            # Preserve runtime type while satisfying static typing
-            self.embedding_func = cast(EmbeddingFunc, wrapped)
+            )(self.embedding_func.func)
+            # Use dataclasses.replace() to create a new instance, leaving the original unchanged
+            self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 
         if self.embedding_func is None:
             raise ValueError('embedding_func must be provided before initializing storages')
@@ -1034,6 +1040,22 @@ class LightRAG:
         import_path = STORAGES[storage_name]
         storage_class = lazy_external_import(import_path, storage_name)
         return storage_class
+
+    @staticmethod
+    def _parse_entity_content(content: str) -> tuple[str, str]:
+        """Parse entity content in 'type: description' format.
+
+        Args:
+            content: Entity content string, optionally in 'type: description' format
+
+        Returns:
+            Tuple of (entity_type, description). If no colon found, returns ('Unknown', content)
+        """
+        if ':' in content:
+            entity_type = content.split(':')[0].strip()
+            description = content.split(':', 1)[1].strip()
+            return entity_type, description
+        return 'Unknown', content
 
     def insert(
         self,
@@ -3870,12 +3892,8 @@ class LightRAG:
                     similarity = candidate.get('similarity', 0.0)
 
                     # Parse entity type from content (format: "entity_type: description")
-                    orphan_type = orphan_content.split(':')[0].strip() if ':' in orphan_content else 'Unknown'
-                    orphan_desc = orphan_content.split(':', 1)[1].strip() if ':' in orphan_content else orphan_content
-                    candidate_type = candidate_content.split(':')[0].strip() if ':' in candidate_content else 'Unknown'
-                    candidate_desc = (
-                        candidate_content.split(':', 1)[1].strip() if ':' in candidate_content else candidate_content
-                    )
+                    orphan_type, orphan_desc = self._parse_entity_content(orphan_content)
+                    candidate_type, candidate_desc = self._parse_entity_content(candidate_content)
 
                     # Build validation prompt
                     validation_prompt = PROMPTS['orphan_connection_validation'].format(
@@ -4157,12 +4175,8 @@ class LightRAG:
                     similarity = candidate.get('similarity', 0.0)
 
                     # Parse entity type from content
-                    orphan_type = orphan_content.split(':')[0].strip() if ':' in orphan_content else 'Unknown'
-                    orphan_desc = orphan_content.split(':', 1)[1].strip() if ':' in orphan_content else orphan_content
-                    candidate_type = candidate_content.split(':')[0].strip() if ':' in candidate_content else 'Unknown'
-                    candidate_desc = (
-                        candidate_content.split(':', 1)[1].strip() if ':' in candidate_content else candidate_content
-                    )
+                    orphan_type, orphan_desc = self._parse_entity_content(orphan_content)
+                    candidate_type, candidate_desc = self._parse_entity_content(candidate_content)
 
                     # Build validation prompt
                     validation_prompt = PROMPTS['orphan_connection_validation'].format(

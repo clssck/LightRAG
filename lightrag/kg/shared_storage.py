@@ -1,14 +1,14 @@
 import asyncio
-import logging
-import os
-import sys
-import time
 from collections.abc import Mapping, MutableMapping
 from contextvars import ContextVar
+import logging
 from multiprocessing import Manager
 from multiprocessing.managers import DictProxy, SyncManager
 from multiprocessing.synchronize import Lock as ProcessLock
-from typing import Any, Generic, Optional, TypeVar, cast
+import os
+import sys
+import time
+from typing import Any, Generic, TypeVar, cast
 
 from lightrag.exceptions import PipelineNotInitializedError
 
@@ -89,7 +89,7 @@ _update_flags: Any | None = None  # namespace -> updated
 _internal_lock: LockType | None = None
 _data_init_lock: LockType | None = None
 # Manager for all keyed locks
-_storage_keyed_lock: Optional['KeyedUnifiedLock'] = None
+_storage_keyed_lock: 'KeyedUnifiedLock | None' = None
 
 # async locks for coroutine synchronization in multiprocess mode
 _async_locks: dict[str, asyncio.Lock] | None = None

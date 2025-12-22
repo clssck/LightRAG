@@ -1,14 +1,15 @@
 import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 import configparser
+from dataclasses import dataclass, field
 import datetime
+from datetime import timezone
+import hashlib
 import itertools
 import json
 import os
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
-from datetime import timezone
 from typing import Any, ClassVar, Literal, TypeVar, cast, final, overload
 
 import numpy as np
@@ -38,11 +39,14 @@ from lightrag.utils import logger
 
 if not pm.is_installed('asyncpg'):
     pm.install('asyncpg')
+if not pm.is_installed('pgvector'):
+    pm.install('pgvector')
 
 import asyncpg  # type: ignore
 from asyncpg import Connection, Pool  # type: ignore
 from asyncpg.pool import PoolConnectionProxy  # type: ignore
 from dotenv import load_dotenv
+from pgvector.asyncpg import register_vector  # type: ignore
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -50,6 +54,42 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path='.env', override=False)
 
 T = TypeVar('T')
+
+# PostgreSQL identifier length limit (in bytes)
+PG_MAX_IDENTIFIER_LENGTH = 63
+
+
+def _safe_index_name(table_name: str, index_suffix: str) -> str:
+    """
+    Generate a PostgreSQL-safe index name that won't be truncated.
+
+    PostgreSQL silently truncates identifiers to 63 bytes. This function
+    ensures index names stay within that limit by hashing long table names.
+
+    Args:
+        table_name: The table name (may be long with model suffix)
+        index_suffix: The index type suffix (e.g., 'hnsw_cosine', 'id', 'workspace_id')
+
+    Returns:
+        A deterministic index name that fits within 63 bytes
+    """
+    # Construct the full index name
+    full_name = f'idx_{table_name.lower()}_{index_suffix}'
+
+    # If it fits within the limit, use it as-is
+    if len(full_name.encode('utf-8')) <= PG_MAX_IDENTIFIER_LENGTH:
+        return full_name
+
+    # Otherwise, hash the table name to create a shorter unique identifier
+    # Keep 'idx_' prefix and suffix readable, hash the middle
+    hash_input = table_name.lower().encode('utf-8')
+    table_hash = hashlib.md5(hash_input).hexdigest()[:12]  # 12 hex chars
+
+    # Format: idx_{hash}_{suffix} - guaranteed to fit
+    # Maximum: idx_ (4) + hash (12) + _ (1) + suffix (variable) = 17 + suffix
+    shortened_name = f'idx_{table_hash}_{index_suffix}'
+
+    return shortened_name
 
 
 class PostgreSQLDB:
@@ -202,6 +242,9 @@ class PostgreSQLDB:
             'port': self.port,
             'min_size': self.min,  # Configurable via POSTGRES_MIN_CONNECTIONS
             'max_size': self.max,
+            # Connection reliability: prevent unbounded query hangs (60s default)
+            # Individual queries that exceed this will raise asyncpg.TimeoutError
+            'command_timeout': 60.0,
         }
 
         # Only add statement_cache_size if it's configured
@@ -248,14 +291,41 @@ class PostgreSQLDB:
             else wait_fixed(0)
         )
 
+        async def _init_connection(connection: asyncpg.Connection) -> None:
+            """Initialize each connection with pgvector codec.
+
+            This callback is invoked by asyncpg for every new connection in the pool.
+            Registering the vector codec here ensures ALL connections can properly
+            encode/decode vector columns, eliminating non-deterministic behavior
+            where some connections have the codec and others don't.
+            """
+            await register_vector(connection)
+
         async def _create_pool_once() -> None:
-            pool = await asyncpg.create_pool(**connection_params)  # type: ignore
+            # STEP 1: Bootstrap - ensure vector extension exists BEFORE pool creation.
+            # On a fresh database, register_vector() in _init_connection will fail
+            # if the vector extension doesn't exist yet, because the 'vector' type
+            # won't be found in pg_catalog. We must create the extension first
+            # using a standalone bootstrap connection.
+            bootstrap_conn = await asyncpg.connect(
+                user=self.user,
+                password=self.password,
+                database=self.database,
+                host=self.host,
+                port=self.port,
+                ssl=connection_params.get('ssl'),
+            )
             try:
-                async with pool.acquire() as connection:
-                    await self.configure_vector_extension(connection)
-            except Exception:
-                await pool.close()
-                raise
+                await self.configure_vector_extension(bootstrap_conn)
+            finally:
+                await bootstrap_conn.close()
+
+            # STEP 2: Now safe to create pool with register_vector callback.
+            # The vector extension is guaranteed to exist at this point.
+            pool = await asyncpg.create_pool(
+                **connection_params,
+                init=_init_connection,  # Register pgvector codec on every connection
+            )  # type: ignore
             self.pool = pool
 
         try:
@@ -471,7 +541,12 @@ class PostgreSQLDB:
         """
         if self.hnsw_ef_search is not None:
             await connection.execute(f'SET hnsw.ef_search = {int(self.hnsw_ef_search)}')
-            logger.debug(f'PostgreSQL, HNSW ef_search set to: {self.hnsw_ef_search}')
+            # ef_search controls recall vs speed tradeoff: higher = better recall, slower queries
+            # Default 200 is moderate; for accuracy-critical apps, set POSTGRES_HNSW_EF_SEARCH=400+
+            logger.debug(
+                f'PostgreSQL, HNSW ef_search={self.hnsw_ef_search} '
+                f'(tune via POSTGRES_HNSW_EF_SEARCH for recall/speed tradeoff)'
+            )
 
     async def _run_migration(self, migration_coro, migration_name: str, error_msg: str) -> bool:
         """Run a migration with error tracking.
@@ -1219,7 +1294,12 @@ class PostgreSQLDB:
             gin_indexes = [
                 ('idx_lightrag_vdb_entity_chunk_ids_gin', 'LIGHTRAG_VDB_ENTITY', 'USING gin (chunk_ids)'),
                 ('idx_lightrag_vdb_relation_chunk_ids_gin', 'LIGHTRAG_VDB_RELATION', 'USING gin (chunk_ids)'),
-                # Full-text search GIN index for BM25 keyword search on chunks
+                # Full-text search GIN index for BM25 keyword search on chunks.
+                # IMPORTANT: This index is built for 'english' language. Queries using
+                # hybrid_search() or bm25_search() must use language='english' (the default)
+                # for the index to be utilized. Using a different language will trigger a
+                # sequential scan. For non-English content, create a separate index:
+                #   CREATE INDEX ... USING gin (to_tsvector('german', content))
                 (
                     'idx_lightrag_doc_chunks_content_fts_gin',
                     'LIGHTRAG_DOC_CHUNKS',
@@ -1228,10 +1308,12 @@ class PostgreSQLDB:
             ]
 
             # Create GIN indexes separately (different syntax)
+            # Note: CONCURRENTLY cannot be used with IF NOT EXISTS, so we check first
             for index_name, table_name, index_type in gin_indexes:
                 if index_name not in existing_indexes:
                     try:
-                        create_gin_sql = f'CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} {index_type}'
+                        # Use CONCURRENTLY for non-blocking index creation on large tables
+                        create_gin_sql = f'CREATE INDEX CONCURRENTLY {index_name} ON {table_name} {index_type}'
                         logger.info(f'PostgreSQL, Creating GIN index {index_name} on {table_name}')
                         await self.execute(create_gin_sql)
                     except Exception as e:
@@ -1240,7 +1322,8 @@ class PostgreSQLDB:
             for index_name, table_name, columns in performance_indexes:
                 if index_name not in existing_indexes:
                     try:
-                        create_perf_index_sql = f'CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}{columns}'
+                        # Use CONCURRENTLY for non-blocking index creation
+                        create_perf_index_sql = f'CREATE INDEX CONCURRENTLY {index_name} ON {table_name}{columns}'
                         logger.info(f'PostgreSQL, Creating performance index {index_name} on {table_name}')
                         await self.execute(create_perf_index_sql)
                     except Exception as e:
@@ -1351,6 +1434,18 @@ class PostgreSQLDB:
             self._migrate_entity_aliases_schema(),
             'entity_aliases_schema',
             'Failed to migrate entity aliases schema',
+        )
+
+        await self._run_migration(
+            self._configure_autovacuum_settings(),
+            'autovacuum_settings',
+            'Failed to configure autovacuum settings',
+        )
+
+        await self._run_migration(
+            self._add_unique_constraints(),
+            'unique_constraints',
+            'Failed to add unique constraints for data integrity',
         )
 
         # Log migration summary
@@ -1527,6 +1622,124 @@ class PostgreSQLDB:
             except Exception as e:
                 logger.warning(f'PostgreSQL, Failed to add CHECK constraint {constraint_name} to {table_name}: {e}')
 
+    async def _configure_autovacuum_settings(self):
+        """Configure aggressive autovacuum for high-churn tables.
+
+        Large tables like DOC_STATUS and VDB_CHUNKS benefit from more frequent
+        vacuum and analyze operations to maintain optimal query plans.
+        Default scale factors (0.2/0.1) are too conservative for tables with
+        millions of rows - we use 0.02/0.01 for ~10x more frequent maintenance.
+        """
+        tables = ['LIGHTRAG_DOC_STATUS', 'LIGHTRAG_VDB_CHUNKS']
+
+        for table_name in tables:
+            # Check if table exists first
+            check_sql = """
+            SELECT table_name FROM information_schema.tables
+            WHERE table_name = $1 AND table_schema = 'public'
+            """
+            exists = await self.query(check_sql, [table_name.lower()])
+            if not exists:
+                continue
+
+            try:
+                # Set aggressive autovacuum parameters:
+                # - vacuum_scale_factor 0.02: vacuum after 2% of rows change (vs 20% default)
+                # - analyze_scale_factor 0.01: analyze after 1% of rows change (vs 10% default)
+                settings_sql = f"""
+                ALTER TABLE {table_name} SET (
+                    autovacuum_vacuum_scale_factor = 0.02,
+                    autovacuum_analyze_scale_factor = 0.01
+                )
+                """
+                await self.execute(settings_sql)
+                logger.debug(f'PostgreSQL, Configured autovacuum settings for {table_name}')
+            except Exception as e:
+                # Non-fatal - table will still function with default vacuum settings
+                logger.warning(f'PostgreSQL, Failed to configure autovacuum for {table_name}: {e}')
+
+    async def _add_unique_constraints(self):
+        """Add UNIQUE constraints to prevent duplicate entities and relations.
+
+        Duplicates cause:
+        - Vector search returning redundant results
+        - Biased similarity scores toward repeated data
+        - Entity resolution returning multiple rows for same entity
+
+        The migration first removes any existing duplicates (keeping newest),
+        then adds the constraints.
+        """
+        constraints = [
+            {
+                'table': 'LIGHTRAG_VDB_ENTITY',
+                'constraint': 'lightrag_vdb_entity_unique',
+                'columns': '(workspace, entity_name)',
+                'dedup_key': 'entity_name',
+            },
+            {
+                'table': 'LIGHTRAG_VDB_RELATION',
+                'constraint': 'lightrag_vdb_relation_unique',
+                'columns': '(workspace, source_id, target_id)',
+                'dedup_key': 'source_id, target_id',
+            },
+        ]
+
+        for item in constraints:
+            table = item['table']
+            constraint = item['constraint']
+            columns = item['columns']
+            dedup_key = item['dedup_key']
+
+            # Check if table exists
+            check_table_sql = """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_name = $1 AND table_schema = 'public'
+            """
+            exists = await self.query(check_table_sql, [table.lower()])
+            if not exists:
+                continue
+
+            # Check if constraint already exists
+            check_constraint_sql = """
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE table_name = $1 AND constraint_name = $2
+            AND constraint_type = 'UNIQUE' AND table_schema = 'public'
+            """
+            constraint_exists = await self.query(check_constraint_sql, [table.lower(), constraint])
+            if constraint_exists:
+                logger.debug(f'PostgreSQL, UNIQUE constraint {constraint} already exists')
+                continue
+
+            try:
+                # Step 1: Remove duplicates, keeping the row with latest update_time
+                # Uses a CTE to identify duplicates and delete all but the newest
+                dedup_sql = f"""
+                DELETE FROM {table} a
+                USING (
+                    SELECT workspace, {dedup_key}, MAX(update_time) as max_time
+                    FROM {table}
+                    GROUP BY workspace, {dedup_key}
+                    HAVING COUNT(*) > 1
+                ) b
+                WHERE a.workspace = b.workspace
+                  AND a.{dedup_key.split(',')[0].strip()} = b.{dedup_key.split(',')[0].strip()}
+                  AND a.update_time < b.max_time
+                """
+                await self.execute(dedup_sql)
+                logger.debug(f'PostgreSQL, Removed duplicates from {table}')
+
+                # Step 2: Add the UNIQUE constraint
+                add_constraint_sql = f"""
+                ALTER TABLE {table}
+                ADD CONSTRAINT {constraint} UNIQUE {columns}
+                """
+                await self.execute(add_constraint_sql)
+                logger.info(f'PostgreSQL, Added UNIQUE constraint {constraint} to {table}')
+
+            except Exception as e:
+                # Log but don't fail - the table still works without the constraint
+                logger.warning(f'PostgreSQL, Failed to add UNIQUE constraint to {table}: {e}')
+
     async def _create_pagination_indexes(self):
         """Create indexes to optimize pagination queries for LIGHTRAG_DOC_STATUS"""
         indexes = [
@@ -1560,6 +1773,45 @@ class PostgreSQLDB:
                 'sql': 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_workspace_file_path ON LIGHTRAG_DOC_STATUS (workspace, file_path)',
                 'description': 'Index for workspace + file_path sorting',
             },
+            # Partial indexes for common status filters - smaller and faster than full indexes
+            # These cover the most frequently queried status values
+            {
+                'name': 'idx_lightrag_doc_status_pending',
+                'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_pending ON LIGHTRAG_DOC_STATUS (workspace, updated_at DESC) WHERE status = 'PENDING'",
+                'description': 'Partial index for PENDING status queries',
+            },
+            {
+                'name': 'idx_lightrag_doc_status_processing',
+                'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_processing ON LIGHTRAG_DOC_STATUS (workspace, updated_at DESC) WHERE status = 'PROCESSING'",
+                'description': 'Partial index for PROCESSING status queries',
+            },
+            {
+                'name': 'idx_lightrag_doc_status_failed',
+                'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_doc_status_failed ON LIGHTRAG_DOC_STATUS (workspace, updated_at DESC) WHERE status = 'FAILED'",
+                'description': 'Partial index for FAILED status queries',
+            },
+        ]
+
+        # Entity/Relation indexes for faster lookups and deletions
+        entity_indexes = [
+            {
+                'table': 'lightrag_vdb_entity',
+                'name': 'idx_lightrag_vdb_entity_name',
+                'sql': 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_vdb_entity_name ON LIGHTRAG_VDB_ENTITY (workspace, entity_name)',
+                'description': 'Index for entity name lookups',
+            },
+            {
+                'table': 'lightrag_vdb_relation',
+                'name': 'idx_lightrag_vdb_relation_source',
+                'sql': 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_vdb_relation_source ON LIGHTRAG_VDB_RELATION (workspace, source_id)',
+                'description': 'Index for relation source lookups',
+            },
+            {
+                'table': 'lightrag_vdb_relation',
+                'name': 'idx_lightrag_vdb_relation_target',
+                'sql': 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_lightrag_vdb_relation_target ON LIGHTRAG_VDB_RELATION (workspace, target_id)',
+                'description': 'Index for relation target lookups',
+            },
         ]
 
         for index in indexes:
@@ -1577,6 +1829,27 @@ class PostgreSQLDB:
 
                 if not existing:
                     logger.info(f'Creating pagination index: {index["description"]}')
+                    await self.execute(index['sql'])
+                    logger.info(f'Successfully created index: {index["name"]}')
+                else:
+                    logger.debug(f'Index already exists: {index["name"]}')
+
+            except Exception as e:
+                logger.warning(f'Failed to create index {index["name"]}: {e}')
+
+        # Create entity/relation indexes
+        for index in entity_indexes:
+            try:
+                check_sql = """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE tablename = $1
+                AND indexname = $2
+                """
+                existing = await self.query(check_sql, [index['table'], index['name']])
+
+                if not existing:
+                    logger.info(f'Creating entity index: {index["description"]}')
                     await self.execute(index['sql'])
                     logger.info(f'Successfully created index: {index["name"]}')
                 else:
@@ -1689,6 +1962,24 @@ class PostgreSQLDB:
             logger.error(f'PostgreSQL database, error:{e}')
             raise
 
+    async def check_table_exists(self, table_name: str) -> bool:
+        """Check if a table exists in PostgreSQL database.
+
+        Args:
+            table_name: Name of the table to check
+
+        Returns:
+            bool: True if table exists, False otherwise
+        """
+        query = """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_name = $1
+            )
+        """
+        result = await self.query(query, [table_name.lower()])
+        return result.get('exists', False) if result else False
+
     async def execute(
         self,
         sql: str,
@@ -1791,8 +2082,15 @@ class PostgreSQLDB:
             if cached_results is not None:
                 return cached_results
 
-        # Use plainto_tsquery for simple query parsing (handles plain text queries)
-        # websearch_to_tsquery could be used for more advanced syntax
+        # Choose query parser based on syntax:
+        # - websearch_to_tsquery: supports "quoted phrases", OR, AND, NOT, -prefix
+        # - plainto_tsquery: simple word matching (default for plain queries)
+        advanced_syntax_chars = ('"', ' OR ', ' AND ', ' NOT ')
+        if any(c in query for c in advanced_syntax_chars) or query.startswith('-'):
+            ts_query_func = 'websearch_to_tsquery'
+        else:
+            ts_query_func = 'plainto_tsquery'
+
         sql = f"""
             SELECT
                 id,
@@ -1804,13 +2102,14 @@ class PostgreSQLDB:
                 s3_key,
                 char_start,
                 char_end,
-                ts_rank(
+                ts_rank_cd(
                     to_tsvector('{language}', content),
-                    plainto_tsquery('{language}', $1)
+                    {ts_query_func}('{language}', $1),
+                    32
                 ) AS score
             FROM LIGHTRAG_DOC_CHUNKS
             WHERE workspace = $2
-              AND to_tsvector('{language}', content) @@ plainto_tsquery('{language}', $1)
+              AND to_tsvector('{language}', content) @@ {ts_query_func}('{language}', $1)
             ORDER BY score DESC
             LIMIT $3
         """
@@ -2448,7 +2747,7 @@ class PGKVStorage(BaseKVStorage):
             logger.error(f'[{self.workspace}] Unknown namespace for is_empty check: {self.namespace}')
             return True
 
-        sql = f'SELECT EXISTS(SELECT 1 FROM {table_name} WHERE workspace=$1 LIMIT 1) as has_data'
+        sql = f'SELECT EXISTS(SELECT 1 FROM {table_name} WHERE workspace=$1) as has_data'
 
         try:
             db = self._db_required()
@@ -2494,7 +2793,7 @@ class PGKVStorage(BaseKVStorage):
                     'message': f'Unknown namespace: {self.namespace}',
                 }
 
-            drop_sql = SQL_TEMPLATES['drop_specifiy_table_workspace'].format(table_name=table_name)
+            drop_sql = SQL_TEMPLATES['drop_specific_table_workspace'].format(table_name=table_name)
             db = self._db_required()
             await db.execute(drop_sql, {'workspace': self.workspace})
             return {'status': 'success', 'message': 'data dropped'}
@@ -2564,6 +2863,7 @@ class PGVectorStorage(BaseVectorStorage):
         return self.db
 
     def __post_init__(self):
+        super().__post_init__()  # Validate embedding_func from BaseVectorStorage
         self._max_batch_size = self.global_config['embedding_batch_num']
         config = self.global_config.get('vector_db_storage_cls_kwargs', {})
         cosine_threshold = config.get('cosine_better_than_threshold')
@@ -2748,6 +3048,13 @@ class PGVectorStorage(BaseVectorStorage):
         vector_results = await self.query(query, top_k=vector_fetch_k, query_embedding=query_embedding)
 
         # 2. BM25 full-text search (query LIGHTRAG_DOC_CHUNKS directly)
+        # Choose query parser based on syntax (same logic as full_text_search)
+        advanced_syntax_chars = ('"', ' OR ', ' AND ', ' NOT ')
+        if any(c in query for c in advanced_syntax_chars) or query.startswith('-'):
+            ts_query_func = 'websearch_to_tsquery'
+        else:
+            ts_query_func = 'plainto_tsquery'
+
         bm25_sql = f"""
             SELECT
                 id,
@@ -2756,13 +3063,14 @@ class PGVectorStorage(BaseVectorStorage):
                 tokens,
                 content,
                 file_path,
-                ts_rank(
+                ts_rank_cd(
                     to_tsvector('{language}', content),
-                    plainto_tsquery('{language}', $1)
+                    {ts_query_func}('{language}', $1),
+                    32
                 ) AS bm25_score
             FROM LIGHTRAG_DOC_CHUNKS
             WHERE workspace = $2
-              AND to_tsvector('{language}', content) @@ plainto_tsquery('{language}', $1)
+              AND to_tsvector('{language}', content) @@ {ts_query_func}('{language}', $1)
             ORDER BY bm25_score DESC
             LIMIT $3
         """
@@ -2918,6 +3226,13 @@ class PGVectorStorage(BaseVectorStorage):
         vector_results = await self.query(query, top_k=vector_fetch_k, query_embedding=query_embedding)
 
         # 2. BM25 full-text search
+        # Choose query parser based on syntax (same logic as full_text_search)
+        advanced_syntax_chars = ('"', ' OR ', ' AND ', ' NOT ')
+        if any(c in query for c in advanced_syntax_chars) or query.startswith('-'):
+            ts_query_func = 'websearch_to_tsquery'
+        else:
+            ts_query_func = 'plainto_tsquery'
+
         bm25_sql = f"""
             SELECT
                 id,
@@ -2926,13 +3241,14 @@ class PGVectorStorage(BaseVectorStorage):
                 tokens,
                 content,
                 file_path,
-                ts_rank(
+                ts_rank_cd(
                     to_tsvector('{language}', content),
-                    plainto_tsquery('{language}', $1)
+                    {ts_query_func}('{language}', $1),
+                    32
                 ) AS bm25_score
             FROM LIGHTRAG_DOC_CHUNKS
             WHERE workspace = $2
-              AND to_tsvector('{language}', content) @@ plainto_tsquery('{language}', $1)
+              AND to_tsvector('{language}', content) @@ {ts_query_func}('{language}', $1)
             ORDER BY bm25_score DESC
             LIMIT $3
         """
@@ -3144,10 +3460,18 @@ class PGVectorStorage(BaseVectorStorage):
             for result in results:
                 if result and 'content_vector' in result and 'id' in result:
                     try:
-                        # Parse JSON string to get vector as list of floats
-                        vector_data = json.loads(result['content_vector'])
-                        if isinstance(vector_data, list):
-                            vectors_dict[result['id']] = vector_data
+                        vector_data = result['content_vector']
+                        # Handle both pgvector-registered connections (returns list/tuple)
+                        # and non-registered connections (returns JSON string)
+                        if isinstance(vector_data, (list, tuple)):
+                            vectors_dict[result['id']] = list(vector_data)
+                        elif isinstance(vector_data, str):
+                            parsed = json.loads(vector_data)
+                            if isinstance(parsed, list):
+                                vectors_dict[result['id']] = parsed
+                        # Handle numpy arrays from pgvector
+                        elif hasattr(vector_data, 'tolist'):
+                            vectors_dict[result['id']] = vector_data.tolist()
                     except (json.JSONDecodeError, TypeError) as e:
                         logger.warning(f'[{self.workspace}] Failed to parse vector data for ID {result["id"]}: {e}')
 
@@ -3166,7 +3490,7 @@ class PGVectorStorage(BaseVectorStorage):
                     'message': f'Unknown namespace: {self.namespace}',
                 }
 
-            drop_sql = SQL_TEMPLATES['drop_specifiy_table_workspace'].format(table_name=table_name)
+            drop_sql = SQL_TEMPLATES['drop_specific_table_workspace'].format(table_name=table_name)
             db = self._db_required()
             await db.execute(drop_sql, {'workspace': self.workspace})
             return {'status': 'success', 'message': 'data dropped'}
@@ -3193,6 +3517,40 @@ class PGDocStatusStorage(DocStatusStorage):
             dt = dt.replace(tzinfo=timezone.utc)
         # If datetime already has timezone info, keep it as is
         return dt.isoformat()
+
+    @staticmethod
+    def _parse_json_list(value: Any, default: list | None = None) -> list:
+        """Parse a JSON list field that may be str, list, or None."""
+        if default is None:
+            default = []
+        if value is None:
+            return default
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else default
+            except json.JSONDecodeError:
+                return default
+        return default
+
+    @staticmethod
+    def _parse_json_dict(value: Any, default: dict | None = None) -> dict:
+        """Parse a JSON dict field that may be str, dict, or None."""
+        if default is None:
+            default = {}
+        if value is None:
+            return default
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else default
+            except json.JSONDecodeError:
+                return default
+        return default
 
     async def initialize(self):
         async with get_data_init_lock():
@@ -3243,38 +3601,19 @@ class PGDocStatusStorage(DocStatusStorage):
         if result is None or result == []:
             return None
         else:
-            # Parse chunks_list JSON string back to list
-            chunks_list = result[0].get('chunks_list', [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = result[0].get('metadata', {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(result[0]['created_at'])
-            updated_at = self._format_datetime_with_timezone(result[0]['updated_at'])
-
+            row = result[0]
             return {
-                'content_length': result[0]['content_length'],
-                'content_summary': result[0]['content_summary'],
-                'status': result[0]['status'],
-                'chunks_count': result[0]['chunks_count'],
-                'created_at': created_at,
-                'updated_at': updated_at,
-                'file_path': result[0]['file_path'],
-                'chunks_list': chunks_list,
-                'metadata': metadata,
-                'error_msg': result[0].get('error_msg'),
-                'track_id': result[0].get('track_id'),
+                'content_length': row['content_length'],
+                'content_summary': row['content_summary'],
+                'status': row['status'],
+                'chunks_count': row['chunks_count'],
+                'created_at': self._format_datetime_with_timezone(row['created_at']),
+                'updated_at': self._format_datetime_with_timezone(row['updated_at']),
+                'file_path': row['file_path'],
+                'chunks_list': self._parse_json_list(row.get('chunks_list')),
+                'metadata': self._parse_json_dict(row.get('metadata')),
+                'error_msg': row.get('error_msg'),
+                'track_id': row.get('track_id'),
             }
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
@@ -3293,36 +3632,16 @@ class PGDocStatusStorage(DocStatusStorage):
 
         processed_map: dict[str, dict[str, Any]] = {}
         for row in results:
-            # Parse chunks_list JSON string back to list
-            chunks_list = row.get('chunks_list', [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = row.get('metadata', {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(row['created_at'])
-            updated_at = self._format_datetime_with_timezone(row['updated_at'])
-
             processed_map[str(row.get('id'))] = {
                 'content_length': row['content_length'],
                 'content_summary': row['content_summary'],
                 'status': row['status'],
                 'chunks_count': row['chunks_count'],
-                'created_at': created_at,
-                'updated_at': updated_at,
+                'created_at': self._format_datetime_with_timezone(row['created_at']),
+                'updated_at': self._format_datetime_with_timezone(row['updated_at']),
                 'file_path': row['file_path'],
-                'chunks_list': chunks_list,
-                'metadata': metadata,
+                'chunks_list': self._parse_json_list(row.get('chunks_list')),
+                'metadata': self._parse_json_dict(row.get('metadata')),
                 'error_msg': row.get('error_msg'),
                 'track_id': row.get('track_id'),
             }
@@ -3351,38 +3670,19 @@ class PGDocStatusStorage(DocStatusStorage):
         if result is None or result == []:
             return None
         else:
-            # Parse chunks_list JSON string back to list
-            chunks_list = result[0].get('chunks_list', [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = result[0].get('metadata', {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(result[0]['created_at'])
-            updated_at = self._format_datetime_with_timezone(result[0]['updated_at'])
-
+            row = result[0]
             return {
-                'content_length': result[0]['content_length'],
-                'content_summary': result[0]['content_summary'],
-                'status': result[0]['status'],
-                'chunks_count': result[0]['chunks_count'],
-                'created_at': created_at,
-                'updated_at': updated_at,
-                'file_path': result[0]['file_path'],
-                'chunks_list': chunks_list,
-                'metadata': metadata,
-                'error_msg': result[0].get('error_msg'),
-                'track_id': result[0].get('track_id'),
+                'content_length': row['content_length'],
+                'content_summary': row['content_summary'],
+                'status': row['status'],
+                'chunks_count': row['chunks_count'],
+                'created_at': self._format_datetime_with_timezone(row['created_at']),
+                'updated_at': self._format_datetime_with_timezone(row['updated_at']),
+                'file_path': row['file_path'],
+                'chunks_list': self._parse_json_list(row.get('chunks_list')),
+                'metadata': self._parse_json_dict(row.get('metadata')),
+                'error_msg': row.get('error_msg'),
+                'track_id': row.get('track_id'),
             }
 
     async def get_status_counts(self) -> dict[str, int]:
@@ -3408,44 +3708,17 @@ class PGDocStatusStorage(DocStatusStorage):
 
         docs_by_status = {}
         for element in result:
-            # Parse chunks_list JSON string back to list
-            chunks_list = element.get('chunks_list', [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = element.get('metadata', {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-            # Ensure metadata is a dict
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            # Safe handling for file_path
-            file_path = element.get('file_path')
-            if file_path is None:
-                file_path = 'no-file-path'
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(element['created_at']) or ''
-            updated_at = self._format_datetime_with_timezone(element['updated_at']) or ''
-
+            file_path = element.get('file_path') or 'no-file-path'
             docs_by_status[element['id']] = DocProcessingStatus(
                 content_summary=element['content_summary'],
                 content_length=element['content_length'],
                 status=element['status'],
-                created_at=created_at,
-                updated_at=updated_at,
+                created_at=self._format_datetime_with_timezone(element['created_at']) or '',
+                updated_at=self._format_datetime_with_timezone(element['updated_at']) or '',
                 chunks_count=element['chunks_count'],
                 file_path=file_path,
-                chunks_list=chunks_list,
-                metadata=metadata,
+                chunks_list=self._parse_json_list(element.get('chunks_list')),
+                metadata=self._parse_json_dict(element.get('metadata')),
                 error_msg=element.get('error_msg'),
                 track_id=element.get('track_id'),
                 s3_key=element.get('s3_key'),
@@ -3462,45 +3735,18 @@ class PGDocStatusStorage(DocStatusStorage):
 
         docs_by_track_id = {}
         for element in result:
-            # Parse chunks_list JSON string back to list
-            chunks_list = element.get('chunks_list', [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = element.get('metadata', {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-            # Ensure metadata is a dict
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            # Safe handling for file_path
-            file_path = element.get('file_path')
-            if file_path is None:
-                file_path = 'no-file-path'
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(element['created_at']) or ''
-            updated_at = self._format_datetime_with_timezone(element['updated_at']) or ''
-
+            file_path = element.get('file_path') or 'no-file-path'
             docs_by_track_id[element['id']] = DocProcessingStatus(
                 content_summary=element['content_summary'],
                 content_length=element['content_length'],
                 status=element['status'],
-                created_at=created_at,
-                updated_at=updated_at,
+                created_at=self._format_datetime_with_timezone(element['created_at']) or '',
+                updated_at=self._format_datetime_with_timezone(element['updated_at']) or '',
                 chunks_count=element['chunks_count'],
                 file_path=file_path,
-                chunks_list=chunks_list,
+                chunks_list=self._parse_json_list(element.get('chunks_list')),
                 track_id=element.get('track_id'),
-                metadata=metadata,
+                metadata=self._parse_json_dict(element.get('metadata')),
                 error_msg=element.get('error_msg'),
                 s3_key=element.get('s3_key'),
             )
@@ -3561,15 +3807,11 @@ class PGDocStatusStorage(DocStatusStorage):
         # Build ORDER BY clause using validated whitelist values
         order_clause = f'ORDER BY {sort_field} {sort_direction.upper()}'
 
-        # Query for total count
-        count_sql = f'SELECT COUNT(*) as total FROM LIGHTRAG_DOC_STATUS {where_clause}'
-        db = self._db_required()
-        count_result = await db.query(count_sql, list(params.values()))
-        total_count = count_result['total'] if count_result else 0
-
-        # Query for paginated data with parameterized LIMIT and OFFSET
+        # Single query with window function for count + data (avoids separate round-trip)
+        # COUNT(*) OVER() computes total matching rows before LIMIT/OFFSET is applied
         data_sql = f"""
-            SELECT * FROM LIGHTRAG_DOC_STATUS
+            SELECT *, COUNT(*) OVER() as total_count
+            FROM LIGHTRAG_DOC_STATUS
             {where_clause}
             {order_clause}
             LIMIT ${param_count + 1} OFFSET ${param_count + 2}
@@ -3578,48 +3820,30 @@ class PGDocStatusStorage(DocStatusStorage):
         params['offset'] = offset
         param_values = list(params.values())
 
+        db = self._db_required()
         result = await db.query(data_sql, param_values, multirows=True)
+
+        # Extract total count from first row (same for all rows due to OVER())
+        total_count = result[0]['total_count'] if result else 0
 
         # Convert to (doc_id, DocProcessingStatus) tuples
         documents = []
         for element in result:
-            doc_id = element['id']
-
-            # Parse chunks_list JSON string back to list
-            chunks_list = element.get('chunks_list', [])
-            if isinstance(chunks_list, str):
-                try:
-                    chunks_list = json.loads(chunks_list)
-                except json.JSONDecodeError:
-                    chunks_list = []
-
-            # Parse metadata JSON string back to dict
-            metadata = element.get('metadata', {})
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except json.JSONDecodeError:
-                    metadata = {}
-
-            # Convert datetime objects to ISO format strings with timezone info
-            created_at = self._format_datetime_with_timezone(element['created_at']) or ''
-            updated_at = self._format_datetime_with_timezone(element['updated_at']) or ''
-
             doc_status = DocProcessingStatus(
                 content_summary=element['content_summary'],
                 content_length=element['content_length'],
                 status=element['status'],
-                created_at=created_at,
-                updated_at=updated_at,
+                created_at=self._format_datetime_with_timezone(element['created_at']) or '',
+                updated_at=self._format_datetime_with_timezone(element['updated_at']) or '',
                 chunks_count=element['chunks_count'],
                 file_path=element['file_path'],
-                chunks_list=chunks_list,
+                chunks_list=self._parse_json_list(element.get('chunks_list')),
                 track_id=element.get('track_id'),
-                metadata=metadata,
+                metadata=self._parse_json_dict(element.get('metadata')),
                 error_msg=element.get('error_msg'),
                 s3_key=element.get('s3_key'),
             )
-            documents.append((doc_id, doc_status))
+            documents.append((element['id'], doc_status))
 
         return documents, total_count
 
@@ -3665,7 +3889,7 @@ class PGDocStatusStorage(DocStatusStorage):
             logger.error(f'[{self.workspace}] Unknown namespace for is_empty check: {self.namespace}')
             return True
 
-        sql = f'SELECT EXISTS(SELECT 1 FROM {table_name} WHERE workspace=$1 LIMIT 1) as has_data'
+        sql = f'SELECT EXISTS(SELECT 1 FROM {table_name} WHERE workspace=$1) as has_data'
 
         try:
             db = self._db_required()
@@ -3814,7 +4038,7 @@ class PGDocStatusStorage(DocStatusStorage):
                     'message': f'Unknown namespace: {self.namespace}',
                 }
 
-            drop_sql = SQL_TEMPLATES['drop_specifiy_table_workspace'].format(table_name=table_name)
+            drop_sql = SQL_TEMPLATES['drop_specific_table_workspace'].format(table_name=table_name)
             db = self._db_required()
             await db.execute(drop_sql, {'workspace': self.workspace})
             return {'status': 'success', 'message': 'data dropped'}
@@ -3970,8 +4194,8 @@ class PGGraphStorage(BaseGraphStorage):
         - Migration status
         - Graph information
         """
-        import time
         from datetime import datetime
+        import time
 
         result: dict[str, Any] = {
             'status': 'healthy',
@@ -4627,7 +4851,9 @@ class PGGraphStorage(BaseGraphStorage):
                    $$, $1::agtype) AS (n agtype)"""
 
         try:
-            await self._query(query, readonly=False, params={'params': json.dumps({'node_ids': [label]}, ensure_ascii=False)})
+            await self._query(
+                query, readonly=False, params={'params': json.dumps({'node_ids': [label]}, ensure_ascii=False)}
+            )
         except Exception as e:
             logger.error(f'[{self.workspace}] Error during node deletion: {e}')
             raise
@@ -6029,7 +6255,7 @@ SQL_TEMPLATES = {
               LIMIT $3;
               """,
     # DROP tables
-    'drop_specifiy_table_workspace': """
+    'drop_specific_table_workspace': """
         DELETE FROM {table_name} WHERE workspace=$1
        """,
     # Entity alias cache

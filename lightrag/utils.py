@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 import contextlib
 import csv
+from dataclasses import dataclass
+from datetime import datetime
+from functools import wraps
+from hashlib import md5
 import html
+import importlib
+import inspect
 import json
 import logging
 import logging.handlers
@@ -11,22 +18,18 @@ import os
 import re
 import sys
 import time
-import uuid
-import weakref
-from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
-from dataclasses import dataclass
-from datetime import datetime
-from functools import wraps
-from hashlib import md5
+import traceback
 from typing import (
     TYPE_CHECKING,
     Any,
     Protocol,
     cast,
 )
+import uuid
+import weakref
 
-import numpy as np
 from dotenv import load_dotenv
+import numpy as np
 
 from lightrag.constants import (
     DEFAULT_LOG_BACKUP_COUNT,
@@ -375,21 +378,67 @@ class TaskState:
 
 @dataclass
 class EmbeddingFunc:
-    """Embedding function wrapper with dimension validation
+    """Embedding function wrapper with dimension validation.
+
     This class wraps an embedding function to ensure that the output embeddings have the correct dimension.
-    This class should not be wrapped multiple times.
+    If wrapped multiple times, the inner wrappers will be automatically unwrapped to prevent
+    configuration conflicts where inner wrapper settings would override outer wrapper settings.
+
+    Using functools.partial for parameter binding:
+        A common pattern is to use functools.partial to pre-bind model and host parameters
+        to an embedding function. When the base embedding function is already decorated with
+        @wrap_embedding_func_with_attrs (e.g., ollama_embed), use `.func` to access the
+        original unwrapped function to avoid double wrapping:
+
+        Example:
+            from functools import partial
+
+            # ❌ Wrong - causes double wrapping (inner EmbeddingFunc still executes)
+            func=partial(ollama_embed, embed_model="bge-m3:latest", host="http://localhost:11434")
+
+            # ✅ Correct - access the unwrapped function via .func
+            func=partial(ollama_embed.func, embed_model="bge-m3:latest", host="http://localhost:11434")
 
     Args:
-        embedding_dim: Expected dimension of the embeddings
+        embedding_dim: Expected dimension of the embeddings (for dimension checking and workspace data isolation in vector DB)
         func: The actual embedding function to wrap
-        max_token_size: Optional token limit for the embedding model
-        send_dimensions: Whether to inject embedding_dim as a keyword argument
+        max_token_size: Enable embedding token limit checking for description summarization (set embedding_token_limit in LightRAG)
+        send_dimensions: Whether to inject embedding_dim argument to underlying function
+        model_name: Model name for implementing workspace data isolation in vector DB
     """
 
     embedding_dim: int
     func: Callable
-    max_token_size: int | None = None  # Token limit for the embedding model
-    send_dimensions: bool = False  # Control whether to send embedding_dim to the function
+    max_token_size: int | None = None
+    send_dimensions: bool = False
+    model_name: str | None = None  # Model name for workspace data isolation in vector DB
+
+    def __post_init__(self):
+        """Unwrap nested EmbeddingFunc to prevent double wrapping issues.
+
+        When an EmbeddingFunc wraps another EmbeddingFunc, the inner wrapper's
+        __call__ preprocessing would override the outer wrapper's settings.
+        This method detects and unwraps nested EmbeddingFunc instances to ensure
+        that only the outermost wrapper's configuration is applied.
+        """
+        # Check if func is already an EmbeddingFunc instance and unwrap it
+        max_unwrap_depth = 3  # Safety limit to prevent infinite loops
+        unwrap_count = 0
+        while isinstance(self.func, EmbeddingFunc):
+            unwrap_count += 1
+            if unwrap_count > max_unwrap_depth:
+                raise ValueError(
+                    f'EmbeddingFunc unwrap depth exceeded {max_unwrap_depth}. Possible circular reference detected.'
+                )
+            # Unwrap to get the original function
+            self.func = self.func.func
+
+        if unwrap_count > 0:
+            logger.warning(
+                f'Detected nested EmbeddingFunc wrapping (depth: {unwrap_count}), '
+                'auto-unwrapped to prevent configuration conflicts. '
+                'Consider using .func to access the unwrapped function directly.'
+            )
 
     async def __call__(self, *args, **kwargs) -> np.ndarray:
         # Only inject embedding_dim when send_dimensions is True
@@ -406,6 +455,12 @@ class EmbeddingFunc:
 
             # Inject embedding_dim from decorator
             kwargs['embedding_dim'] = self.embedding_dim
+
+        # Check if underlying function supports max_token_size and inject if not provided
+        if self.max_token_size is not None and 'max_token_size' not in kwargs:
+            sig = inspect.signature(self.func)
+            if 'max_token_size' in sig.parameters:
+                kwargs['max_token_size'] = self.max_token_size
 
         # Call the actual embedding function
         result = await self.func(*args, **kwargs)
@@ -606,7 +661,7 @@ def priority_limit_async_func_call(
                             task_state = task_states[task_id]
                             task_state.worker_started = True
                             # Record execution start time when worker actually begins processing
-                            task_state.execution_start_time = asyncio.get_event_loop().time()
+                            task_state.execution_start_time = asyncio.get_running_loop().time()
 
                         # Check if task was cancelled before worker started
                         if task_state.cancellation_requested or task_state.future.cancelled():
@@ -666,7 +721,7 @@ def priority_limit_async_func_call(
                 while not shutdown_event.is_set():
                     await asyncio.sleep(5)  # Check every 5 seconds
 
-                    current_time = asyncio.get_event_loop().time()
+                    current_time = asyncio.get_running_loop().time()
 
                     # Detect and handle stuck tasks based on execution start time
                     if max_task_duration is not None:
@@ -836,11 +891,11 @@ def priority_limit_async_func_call(
             await ensure_workers()
 
             # Generate unique task ID
-            task_id = f'{id(asyncio.current_task())}_{asyncio.get_event_loop().time()}'
+            task_id = f'{id(asyncio.current_task())}_{asyncio.get_running_loop().time()}'
             future = asyncio.Future()
 
             # Create task state
-            task_state = TaskState(future=future, start_time=asyncio.get_event_loop().time())
+            task_state = TaskState(future=future, start_time=asyncio.get_running_loop().time())
 
             try:
                 # Register task state
@@ -890,8 +945,10 @@ def priority_limit_async_func_call(
                         future.cancel()
 
                     # Wait for worker cleanup with timeout
-                    cleanup_start = asyncio.get_event_loop().time()
-                    while task_id in task_states and asyncio.get_event_loop().time() - cleanup_start < cleanup_timeout:
+                    cleanup_start = asyncio.get_running_loop().time()
+                    while (
+                        task_id in task_states and asyncio.get_running_loop().time() - cleanup_start < cleanup_timeout
+                    ):
                         await asyncio.sleep(0.1)
 
                     raise TimeoutError(f'{queue_name}: User timeout after {_timeout} seconds') from None
@@ -1754,8 +1811,6 @@ def lazy_external_import(module_name: str, class_name: str) -> Callable[..., Any
     package = module.__package__ if module else None
 
     def import_class(*args: Any, **kwargs: Any):
-        import importlib
-
         module = importlib.import_module(module_name, package=package)
         cls = getattr(module, class_name)
         return cls(*args, **kwargs)
@@ -2386,8 +2441,6 @@ async def pick_by_vector_similarity(
 
     except Exception as e:
         logger.error(f'[VECTOR_SIMILARITY] Error in vector similarity sorting: {e}')
-        import traceback
-
         logger.error(f'[VECTOR_SIMILARITY] Traceback: {traceback.format_exc()}')
         # Fallback to simple truncation
         logger.debug('[VECTOR_SIMILARITY] Falling back to simple truncation')

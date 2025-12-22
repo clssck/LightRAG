@@ -1,6 +1,6 @@
+from collections.abc import AsyncIterator
 import os
 import re
-from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import pipmaster as pm

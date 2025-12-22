@@ -289,7 +289,7 @@ class RAGEvaluator:
             latency = (time.perf_counter() - start) * 1000
             return response.choices[0].message.content or "", latency
         except Exception as e:
-            print(f"LLM call failed: {e}")
+            logger.error(f"LLM call failed: {e}")
             return "", 0.0
 
     def run_ragas(self, question: str, answer: str, context: str, ground_truth: str) -> dict[str, float]:
@@ -332,7 +332,7 @@ class RAGEvaluator:
             ragas_score = 0.6 * float(faith) + 0.4 * float(rel)
             return {"faithfulness": float(faith), "relevance": float(rel), "ragas_score": ragas_score}
         except Exception as e:
-            print(f"RAGAS eval failed: {e}")
+            logger.error(f"RAGAS eval failed: {e}")
             return {"faithfulness": 0.0, "relevance": 0.0, "ragas_score": 0.0}
 
     async def evaluate(self, prompt_template: str, test_cases: list[dict], mode: str = "mix") -> PromptScore:
@@ -343,16 +343,16 @@ class RAGEvaluator:
             question = tc["question"]
             ground_truth = tc.get("ground_truth", "")
 
-            print(f"  [{i+1}/{len(test_cases)}] {question[:50]}...")
+            logger.info(f"  [{i+1}/{len(test_cases)}] {question[:50]}...")
 
             context = await self.get_context(question, mode)
             if not context or context == "No relevant context found for the query.":
-                print("    ⚠️ No context, skipping")
+                logger.warning("    No context, skipping")
                 continue
 
             answer, latency = await self.generate_answer(prompt_template, context, question)
             if not answer:
-                print("    ⚠️ Empty answer, skipping")
+                logger.warning("    Empty answer, skipping")
                 continue
 
             scores = self.run_ragas(question, answer, context, ground_truth)
@@ -363,7 +363,7 @@ class RAGEvaluator:
                 "ragas_score": scores["ragas_score"],
                 "latency_ms": latency,
             })
-            print(f"    Faith: {scores['faithfulness']:.3f} | Rel: {scores['relevance']:.3f}")
+            logger.info(f"    Faith: {scores['faithfulness']:.3f} | Rel: {scores['relevance']:.3f}")
 
         if not results:
             return PromptScore(
@@ -434,7 +434,7 @@ class EntityExtractionEvaluator:
             output = response.choices[0].message.content or ""
             return self._parse_extraction_output(output)
         except Exception as e:
-            print(f"Entity extraction failed: {e}")
+            logger.error(f"Entity extraction failed: {e}")
             return {"entities": [], "relations": []}
 
     def _parse_extraction_output(self, output: str) -> dict[str, list]:
@@ -516,7 +516,7 @@ class EntityExtractionEvaluator:
 
         for i, tc in enumerate(test_cases):
             input_text = tc["input_text"]
-            print(f"  [{i+1}/{len(test_cases)}] Extracting entities...")
+            logger.info(f"  [{i+1}/{len(test_cases)}] Extracting entities...")
 
             predicted = await self.extract_entities(prompt_template, input_text)
             metrics = self.calculate_metrics(predicted, tc)
@@ -531,7 +531,7 @@ class EntityExtractionEvaluator:
                 **metrics,
             })
 
-            print(f"    Entity F1: {metrics['entity_f1']:.3f} | Relation F1: {metrics['relation_f1']:.3f}")
+            logger.info(f"    Entity F1: {metrics['entity_f1']:.3f} | Relation F1: {metrics['relation_f1']:.3f}")
 
         if not all_metrics:
             return PromptScore(
@@ -592,7 +592,7 @@ class KeywordsExtractionEvaluator:
                 }
             return {"high_level": [], "low_level": []}
         except Exception as e:
-            print(f"Keywords extraction failed: {e}")
+            logger.error(f"Keywords extraction failed: {e}")
             return {"high_level": [], "low_level": []}
 
     def calculate_metrics(
@@ -644,7 +644,7 @@ class KeywordsExtractionEvaluator:
 
         for i, tc in enumerate(test_cases):
             query = tc["query"]
-            print(f"  [{i+1}/{len(test_cases)}] {query[:50]}...")
+            logger.info(f"  [{i+1}/{len(test_cases)}] {query[:50]}...")
 
             predicted = await self.extract_keywords(prompt_template, query)
             metrics = self.calculate_metrics(predicted, tc)
@@ -657,7 +657,7 @@ class KeywordsExtractionEvaluator:
                 **metrics,
             })
 
-            print(f"    High F1: {metrics['high_level_f1']:.3f} | Low F1: {metrics['low_level_f1']:.3f}")
+            logger.info(f"    High F1: {metrics['high_level_f1']:.3f} | Low F1: {metrics['low_level_f1']:.3f}")
 
         if not all_metrics:
             return PromptScore(
@@ -711,7 +711,7 @@ class SummaryEvaluator:
             )
             return response.choices[0].message.content or ""
         except Exception as e:
-            print(f"Summary generation failed: {e}")
+            logger.error(f"Summary generation failed: {e}")
             return ""
 
     def calculate_metrics(self, summary: str, expected_contains: list[str]) -> dict[str, float]:
@@ -743,7 +743,7 @@ class SummaryEvaluator:
             descriptions = tc["descriptions"]
             expected = tc["expected_summary_contains"]
 
-            print(f"  [{i+1}/{len(test_cases)}] Summarizing {entity_name}...")
+            logger.info(f"  [{i+1}/{len(test_cases)}] Summarizing {entity_name}...")
 
             summary = await self.generate_summary(prompt_template, entity_name, descriptions)
             metrics = self.calculate_metrics(summary, expected)
@@ -755,7 +755,7 @@ class SummaryEvaluator:
                 **metrics,
             })
 
-            print(f"    Coverage: {metrics['coverage']:.3f} | Similarity: {metrics['semantic_similarity']:.3f}")
+            logger.info(f"    Coverage: {metrics['coverage']:.3f} | Similarity: {metrics['semantic_similarity']:.3f}")
 
         if not all_metrics:
             return PromptScore(
@@ -936,13 +936,13 @@ class PromptEvaluationRunner:
             if prompt_type not in self.config.prompt_types:
                 continue
 
-            print(f"\n{'='*60}")
-            print(f"📊 Evaluating: {prompt_key}")
-            print("=" * 60)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Evaluating: {prompt_key}")
+            logger.info("=" * 60)
 
             prompt_template = prompts.get(prompt_key, "")
             if not prompt_template:
-                print(f"  ⚠️ Prompt not found: {prompt_key}")
+                logger.warning(f"  Prompt not found: {prompt_key}")
                 continue
 
             test_cases = self.load_test_data(prompt_type)
@@ -954,7 +954,7 @@ class PromptEvaluationRunner:
             score.prompt_type = prompt_type
 
             results.append(score)
-            print(f"\n✅ {prompt_key}: RAGAS={score.metrics['ragas_score']:.3f}")
+            logger.info(f"\n{prompt_key}: RAGAS={score.metrics['ragas_score']:.3f}")
 
         return results
 
@@ -963,22 +963,22 @@ class PromptEvaluationRunner:
         if PromptType.ENTITY_EXTRACTION not in self.config.prompt_types:
             return None
 
-        print(f"\n{'='*60}")
-        print("📊 Evaluating: entity_extraction_system_prompt")
-        print("=" * 60)
+        logger.info(f"\n{'='*60}")
+        logger.info("Evaluating: entity_extraction_system_prompt")
+        logger.info("=" * 60)
 
         prompts = self.load_prompts()
         prompt_template = prompts.get("entity_extraction_system_prompt", "")
 
         if not prompt_template:
-            print("  ⚠️ Prompt not found")
+            logger.warning("  Prompt not found")
             return None
 
         test_cases = self.load_test_data(PromptType.ENTITY_EXTRACTION)
         evaluator = EntityExtractionEvaluator()
         score = await evaluator.evaluate(prompt_template, test_cases)
 
-        print(f"\n✅ entity_extraction: F1={score.metrics['f1_score']:.3f}")
+        logger.info(f"\nentity_extraction: F1={score.metrics['f1_score']:.3f}")
         return score
 
     async def evaluate_keywords_extraction(self) -> PromptScore | None:
@@ -986,22 +986,22 @@ class PromptEvaluationRunner:
         if PromptType.KEYWORDS_EXTRACTION not in self.config.prompt_types:
             return None
 
-        print(f"\n{'='*60}")
-        print("📊 Evaluating: keywords_extraction")
-        print("=" * 60)
+        logger.info(f"\n{'='*60}")
+        logger.info("Evaluating: keywords_extraction")
+        logger.info("=" * 60)
 
         prompts = self.load_prompts()
         prompt_template = prompts.get("keywords_extraction", "")
 
         if not prompt_template:
-            print("  ⚠️ Prompt not found")
+            logger.warning("  Prompt not found")
             return None
 
         test_cases = self.load_test_data(PromptType.KEYWORDS_EXTRACTION)
         evaluator = KeywordsExtractionEvaluator()
         score = await evaluator.evaluate(prompt_template, test_cases)
 
-        print(f"\n✅ keywords_extraction: F1={score.metrics['keyword_f1']:.3f}")
+        logger.info(f"\nkeywords_extraction: F1={score.metrics['keyword_f1']:.3f}")
         return score
 
     async def evaluate_summary(self) -> PromptScore | None:
@@ -1009,33 +1009,33 @@ class PromptEvaluationRunner:
         if PromptType.SUMMARY not in self.config.prompt_types:
             return None
 
-        print(f"\n{'='*60}")
-        print("📊 Evaluating: summarize_entity_descriptions")
-        print("=" * 60)
+        logger.info(f"\n{'='*60}")
+        logger.info("Evaluating: summarize_entity_descriptions")
+        logger.info("=" * 60)
 
         prompts = self.load_prompts()
         prompt_template = prompts.get("summarize_entity_descriptions", "")
 
         if not prompt_template:
-            print("  ⚠️ Prompt not found")
+            logger.warning("  Prompt not found")
             return None
 
         test_cases = self.load_test_data(PromptType.SUMMARY)
         evaluator = SummaryEvaluator()
         score = await evaluator.evaluate(prompt_template, test_cases)
 
-        print(f"\n✅ summary: Similarity={score.metrics['semantic_similarity']:.3f}")
+        logger.info(f"\nsummary: Similarity={score.metrics['semantic_similarity']:.3f}")
         return score
 
     async def run(self) -> list[PromptScore]:
         """Run all evaluations."""
-        print("=" * 70)
-        print("🚀 COMPREHENSIVE PROMPT EVALUATION")
-        print("=" * 70)
-        print(f"Prompt types: {[p.value for p in self.config.prompt_types]}")
-        print(f"Quick mode: {self.config.quick_mode}")
-        print(f"Output: {self.run_dir}")
-        print("=" * 70)
+        logger.info("=" * 70)
+        logger.info("COMPREHENSIVE PROMPT EVALUATION")
+        logger.info("=" * 70)
+        logger.info(f"Prompt types: {[p.value for p in self.config.prompt_types]}")
+        logger.info(f"Quick mode: {self.config.quick_mode}")
+        logger.info(f"Output: {self.run_dir}")
+        logger.info("=" * 70)
 
         # Run evaluations
         rag_scores = await self.evaluate_rag_prompts()
@@ -1096,18 +1096,18 @@ class PromptEvaluationRunner:
 
     def _print_summary(self):
         """Print evaluation summary."""
-        print("\n" + "=" * 70)
-        print("📊 EVALUATION SUMMARY")
-        print("=" * 70)
+        logger.info("\n" + "=" * 70)
+        logger.info("EVALUATION SUMMARY")
+        logger.info("=" * 70)
 
-        print(f"\n{'Prompt':<35} | {'Type':<15} | {'Primary Score':>15}")
-        print("-" * 70)
+        logger.info(f"\n{'Prompt':<35} | {'Type':<15} | {'Primary Score':>15}")
+        logger.info("-" * 70)
 
         for result in self.results:
-            print(f"{result.prompt_name:<35} | {result.prompt_type.value:<15} | {result.primary_score:>15.3f}")
+            logger.info(f"{result.prompt_name:<35} | {result.prompt_type.value:<15} | {result.primary_score:>15.3f}")
 
-        print("=" * 70)
-        print(f"\nResults saved to: {self.run_dir}")
+        logger.info("=" * 70)
+        logger.info(f"\nResults saved to: {self.run_dir}")
 
     def _generate_report(self):
         """Generate markdown report."""
@@ -1138,7 +1138,7 @@ class PromptEvaluationRunner:
         with open(report_path, "w") as f:
             f.write("\n".join(lines))
 
-        print(f"\n📄 Report generated: {report_path}")
+        logger.info(f"\nReport generated: {report_path}")
 
 
 # ============================================================================

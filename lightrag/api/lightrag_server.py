@@ -3,18 +3,16 @@ LightRAG FastAPI Server
 """
 
 import argparse
+from collections.abc import AsyncIterator
 import configparser
+from contextlib import asynccontextmanager
 import logging
 import logging.config
 import os
-import sys
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from pathlib import Path
+import sys
 from typing import Annotated, Any, cast
 
-import pipmaster as pm
-import uvicorn
 from ascii_colors import ASCIIColors
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -27,9 +25,10 @@ from fastapi.openapi.docs import (
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
+import pipmaster as pm
+import uvicorn
 
-from lightrag import LightRAG, create_chunker
-from lightrag import __version__ as core_version
+from lightrag import LightRAG, __version__ as core_version, create_chunker
 from lightrag.api import __api_version__
 from lightrag.api.auth import auth_handler
 from lightrag.api.routers.alias_routes import create_alias_routes
@@ -99,23 +98,15 @@ class LLMConfigCache:
 
         # Initialize configurations based on binding conditions
         self.openai_llm_options = None
-        self.gemini_llm_options = None
-        self.gemini_embedding_options = None
         self.ollama_llm_options = None
         self.ollama_embedding_options = None
 
-        # Only initialize and log OpenAI options when using OpenAI-related bindings
-        if args.llm_binding in ['openai', 'azure_openai']:
+        # Only initialize and log OpenAI options when using OpenAI binding
+        if args.llm_binding == 'openai':
             from lightrag.llm.binding_options import OpenAILLMOptions
 
             self.openai_llm_options = OpenAILLMOptions.options_dict(args)
             logger.info(f'OpenAI LLM Options: {self.openai_llm_options}')
-
-        if args.llm_binding == 'gemini':
-            from lightrag.llm.binding_options import GeminiLLMOptions
-
-            self.gemini_llm_options = GeminiLLMOptions.options_dict(args)
-            logger.info(f'Gemini LLM Options: {self.gemini_llm_options}')
 
         # Only initialize and log Ollama LLM options when using Ollama LLM binding
         if args.llm_binding == 'ollama':
@@ -138,17 +129,6 @@ class LLMConfigCache:
             except ImportError:
                 logger.warning('OllamaEmbeddingOptions not available, using default configuration')
                 self.ollama_embedding_options = {}
-
-        # Only initialize and log Gemini Embedding options when using Gemini Embedding binding
-        if args.embedding_binding == 'gemini':
-            try:
-                from lightrag.llm.binding_options import GeminiEmbeddingOptions
-
-                self.gemini_embedding_options = GeminiEmbeddingOptions.options_dict(args)
-                logger.info(f'Gemini Embedding Options: {self.gemini_embedding_options}')
-            except ImportError:
-                logger.warning('GeminiEmbeddingOptions not available, using default configuration')
-                self.gemini_embedding_options = {}
 
 
 def check_frontend_build():
@@ -281,26 +261,12 @@ def create_app(args):
     config_cache = LLMConfigCache(args)
 
     # Verify that bindings are correctly setup
-    if args.llm_binding not in [
-        'lollms',
-        'ollama',
-        'openai',
-        'azure_openai',
-        'aws_bedrock',
-        'gemini',
-    ]:
-        raise Exception('llm binding not supported')
+    # Supported: openai (covers OpenAI-compatible APIs), ollama (local)
+    if args.llm_binding not in ['ollama', 'openai']:
+        raise Exception(f'llm binding "{args.llm_binding}" not supported. Use: openai, ollama')
 
-    if args.embedding_binding not in [
-        'lollms',
-        'ollama',
-        'openai',
-        'azure_openai',
-        'aws_bedrock',
-        'jina',
-        'gemini',
-    ]:
-        raise Exception('embedding binding not supported')
+    if args.embedding_binding not in ['ollama', 'openai']:
+        raise Exception(f'embedding binding "{args.embedding_binding}" not supported. Use: openai, ollama')
 
     # Set default hosts if not provided
     if args.llm_binding_host is None:
@@ -508,96 +474,16 @@ def create_app(args):
 
         return optimized_openai_alike_model_complete
 
-    def create_optimized_azure_openai_llm_func(config_cache: LLMConfigCache, args, llm_timeout: int):
-        """Create optimized Azure OpenAI LLM function with pre-processed configuration"""
-
-        async def optimized_azure_openai_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            keyword_extraction=False,
-            **kwargs,
-        ) -> str | AsyncIterator[str]:
-            from lightrag.llm.azure_openai import azure_openai_complete_if_cache
-
-            keyword_extraction = kwargs.pop('keyword_extraction', None)
-            if keyword_extraction:
-                kwargs['response_format'] = GPTKeywordExtractionFormat
-            if history_messages is None:
-                history_messages = []
-
-            # Use pre-processed configuration to avoid repeated parsing
-            kwargs['timeout'] = llm_timeout
-            if config_cache.openai_llm_options:
-                kwargs.update(config_cache.openai_llm_options)
-
-            return await azure_openai_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                base_url=args.llm_binding_host,
-                api_key=os.getenv('AZURE_OPENAI_API_KEY', args.llm_binding_api_key),
-                api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
-                **kwargs,
-            )
-
-        return optimized_azure_openai_model_complete
-
-    def create_optimized_gemini_llm_func(config_cache: LLMConfigCache, args, llm_timeout: int):
-        """Create optimized Gemini LLM function with cached configuration"""
-
-        async def optimized_gemini_model_complete(
-            prompt,
-            system_prompt=None,
-            history_messages=None,
-            keyword_extraction=False,
-            **kwargs,
-        ) -> str | AsyncIterator[str]:
-            from lightrag.llm.gemini import gemini_complete_if_cache
-
-            if history_messages is None:
-                history_messages = []
-
-            # Use pre-processed configuration to avoid repeated parsing
-            kwargs['timeout'] = llm_timeout
-            if config_cache.gemini_llm_options is not None and 'generation_config' not in kwargs:
-                kwargs['generation_config'] = dict(config_cache.gemini_llm_options)
-
-            return await gemini_complete_if_cache(
-                args.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                api_key=args.llm_binding_api_key,
-                base_url=args.llm_binding_host,
-                keyword_extraction=keyword_extraction,
-                **kwargs,
-            )
-
-        return optimized_gemini_model_complete
-
     def create_llm_model_func(binding: str):
         """
         Create LLM model function based on binding type.
-        Uses optimized functions for OpenAI bindings and lazy import for others.
+        Supports: openai (OpenAI-compatible APIs), ollama (local inference)
         """
         try:
-            if binding == 'lollms':
-                from lightrag.llm.lollms import lollms_model_complete
-
-                return lollms_model_complete
-            elif binding == 'ollama':
+            if binding == 'ollama':
                 from lightrag.llm.ollama import ollama_model_complete
 
                 return ollama_model_complete
-            elif binding == 'aws_bedrock':
-                return bedrock_model_complete  # Already defined locally
-            elif binding == 'azure_openai':
-                # Use optimized function with pre-processed configuration
-                return create_optimized_azure_openai_llm_func(config_cache, args, llm_timeout)
-            elif binding == 'gemini':
-                return create_optimized_gemini_llm_func(config_cache, args, llm_timeout)
             else:  # openai and compatible
                 # Use optimized function with pre-processed configuration
                 return create_optimized_openai_llm_func(config_cache, args, llm_timeout)
@@ -609,7 +495,7 @@ def create_app(args):
         Create LLM model kwargs based on binding type.
         Uses lazy import for binding-specific options.
         """
-        if binding in ['lollms', 'ollama']:
+        if binding == 'ollama':
             try:
                 from lightrag.llm.binding_options import OllamaLLMOptions
 
@@ -652,14 +538,13 @@ def create_app(args):
 
         Configuration Rules:
         - When EMBEDDING_MODEL is not set: Uses provider's default model and dimension
-          (e.g., jina-embeddings-v4 with 2048 dims, text-embedding-3-small with 1536 dims)
+          (e.g., text-embedding-3-small with 1536 dims for OpenAI)
         - When EMBEDDING_MODEL is set to a custom model: User MUST also set EMBEDDING_DIM
-          to match the custom model's dimension (e.g., for jina-embeddings-v3, set EMBEDDING_DIM=1024)
+          to match the custom model's dimension
 
         Note: The embedding_dim parameter is automatically injected by EmbeddingFunc wrapper
-        when send_dimensions=True (enabled for Jina and Gemini bindings). This wrapper calls
-        the underlying provider function directly (.func) to avoid double-wrapping, so we must
-        explicitly pass embedding_dim to the provider's underlying function.
+        when send_dimensions=True. This wrapper calls the underlying provider function directly
+        (.func) to avoid double-wrapping.
         """
 
         # Step 1: Import provider function and extract default attributes
@@ -676,26 +561,6 @@ def create_app(args):
                 from lightrag.llm.ollama import ollama_embed
 
                 provider_func = ollama_embed
-            elif binding == 'gemini':
-                from lightrag.llm.gemini import gemini_embed
-
-                provider_func = gemini_embed
-            elif binding == 'jina':
-                from lightrag.llm.jina import jina_embed
-
-                provider_func = jina_embed
-            elif binding == 'azure_openai':
-                from lightrag.llm.azure_openai import azure_openai_embed
-
-                provider_func = azure_openai_embed
-            elif binding == 'aws_bedrock':
-                from lightrag.llm.bedrock import bedrock_embed
-
-                provider_func = bedrock_embed
-            elif binding == 'lollms':
-                from lightrag.llm.lollms import lollms_embed
-
-                provider_func = lollms_embed
 
             # Extract attributes if provider is an EmbeddingFunc
             if provider_func and isinstance(provider_func, EmbeddingFunc):
@@ -720,15 +585,7 @@ def create_app(args):
         # Note: When model is None, each binding will use its own default model
         async def optimized_embedding_function(texts, embedding_dim=None):
             try:
-                if binding == 'lollms':
-                    from lightrag.llm.lollms import lollms_embed
-
-                    # Get real function, skip EmbeddingFunc wrapper if present
-                    actual_func = lollms_embed.func if isinstance(lollms_embed, EmbeddingFunc) else lollms_embed
-                    # lollms embed_model is not used (server uses configured vectorizer)
-                    # Only pass base_url and api_key
-                    return await actual_func(texts, base_url=host, api_key=api_key)
-                elif binding == 'ollama':
+                if binding == 'ollama':
                     from lightrag.llm.ollama import ollama_embed
 
                     # Get real function, skip EmbeddingFunc wrapper if present
@@ -751,64 +608,6 @@ def create_app(args):
                     }
                     if model:
                         kwargs['embed_model'] = model
-                    return await actual_func(**kwargs)
-                elif binding == 'azure_openai':
-                    from lightrag.llm.azure_openai import azure_openai_embed
-
-                    actual_func = (
-                        azure_openai_embed.func if isinstance(azure_openai_embed, EmbeddingFunc) else azure_openai_embed
-                    )
-                    # Pass model only if provided, let function use its default otherwise
-                    kwargs = {'texts': texts, 'api_key': api_key}
-                    if model:
-                        kwargs['model'] = model
-                    return await actual_func(**kwargs)
-                elif binding == 'aws_bedrock':
-                    from lightrag.llm.bedrock import bedrock_embed
-
-                    actual_func = bedrock_embed.func if isinstance(bedrock_embed, EmbeddingFunc) else bedrock_embed
-                    # Pass model only if provided, let function use its default otherwise
-                    kwargs = {'texts': texts}
-                    if model:
-                        kwargs['model'] = model
-                    return await actual_func(**kwargs)
-                elif binding == 'jina':
-                    from lightrag.llm.jina import jina_embed
-
-                    actual_func = jina_embed.func if isinstance(jina_embed, EmbeddingFunc) else jina_embed
-                    # Pass model only if provided, let function use its default (jina-embeddings-v4)
-                    kwargs = {
-                        'texts': texts,
-                        'embedding_dim': embedding_dim,
-                        'base_url': host,
-                        'api_key': api_key,
-                    }
-                    if model:
-                        kwargs['model'] = model
-                    return await actual_func(**kwargs)
-                elif binding == 'gemini':
-                    from lightrag.llm.gemini import gemini_embed
-
-                    actual_func = gemini_embed.func if isinstance(gemini_embed, EmbeddingFunc) else gemini_embed
-
-                    # Use pre-processed configuration if available
-                    if config_cache.gemini_embedding_options is not None:
-                        gemini_options = config_cache.gemini_embedding_options
-                    else:
-                        from lightrag.llm.binding_options import GeminiEmbeddingOptions
-
-                        gemini_options = GeminiEmbeddingOptions.options_dict(args)
-
-                    # Pass model only if provided, let function use its default (gemini-embedding-001)
-                    kwargs = {
-                        'texts': texts,
-                        'base_url': host,
-                        'api_key': api_key,
-                        'embedding_dim': embedding_dim,
-                        'task_type': gemini_options.get('task_type', 'RETRIEVAL_DOCUMENT'),
-                    }
-                    if model:
-                        kwargs['model'] = model
                     return await actual_func(**kwargs)
                 else:  # openai and compatible
                     from lightrag.llm.openai import openai_embed
@@ -846,33 +645,6 @@ def create_app(args):
     llm_timeout = get_env_value('LLM_TIMEOUT', DEFAULT_LLM_TIMEOUT, int)
     embedding_timeout = get_env_value('EMBEDDING_TIMEOUT', DEFAULT_EMBEDDING_TIMEOUT, int)
 
-    async def bedrock_model_complete(
-        prompt,
-        system_prompt=None,
-        history_messages=None,
-        keyword_extraction=False,
-        **kwargs,
-    ) -> str | AsyncIterator[str]:
-        # Lazy import
-        from lightrag.llm.bedrock import bedrock_complete_if_cache
-
-        keyword_extraction = kwargs.pop('keyword_extraction', None)
-        if keyword_extraction:
-            kwargs['response_format'] = GPTKeywordExtractionFormat
-        if history_messages is None:
-            history_messages = []
-
-        # Use global temperature for Bedrock
-        kwargs['temperature'] = get_env_value('BEDROCK_LLM_TEMPERATURE', 1.0, float)
-
-        return await bedrock_complete_if_cache(
-            args.llm_model,
-            prompt,
-            system_prompt=system_prompt,
-            history_messages=history_messages,
-            **kwargs,
-        )
-
     # Create embedding function with optimized configuration and max_token_size inheritance
     import inspect
 
@@ -893,17 +665,9 @@ def create_app(args):
     sig = inspect.signature(embedding_func.func)
     has_embedding_dim_param = 'embedding_dim' in sig.parameters
 
-    # Determine send_dimensions value based on binding type
-    # Jina and Gemini REQUIRE dimension parameter (forced to True)
-    # OpenAI and others: controlled by EMBEDDING_SEND_DIM environment variable
-    if args.embedding_binding in ['jina', 'gemini']:
-        # Jina and Gemini APIs require dimension parameter - always send it
-        send_dimensions = has_embedding_dim_param
-        dimension_control = f'forced by {args.embedding_binding.title()} API'
-    else:
-        # For OpenAI and other bindings, respect EMBEDDING_SEND_DIM setting
-        send_dimensions = embedding_send_dim and has_embedding_dim_param
-        dimension_control = 'by env var' if send_dimensions or not embedding_send_dim else 'by not hasparam'
+    # Determine send_dimensions value based on EMBEDDING_SEND_DIM setting
+    send_dimensions = embedding_send_dim and has_embedding_dim_param
+    dimension_control = 'by env var' if send_dimensions or not embedding_send_dim else 'by not hasparam'
 
     # Set send_dimensions on the EmbeddingFunc instance
     embedding_func.send_dimensions = send_dimensions
@@ -921,74 +685,23 @@ def create_app(args):
     else:
         logger.info('Embedding max_token_size: not set (90% token warning disabled)')
 
-    # Configure rerank function (local or API-based)
+    # Configure rerank function using unified factory
     rerank_model_func = None
     if args.enable_rerank:
-        rerank_binding = os.getenv('RERANK_BINDING', 'local').lower()
+        rerank_binding = os.getenv('RERANK_BINDING', 'cohere').lower()
 
-        if rerank_binding == 'deepinfra':
-            from lightrag.rerank import deepinfra_rerank
+        if rerank_binding == 'local':
+            # Local reranking is disabled - suggest using API reranking
+            logger.warning('Local reranking is disabled. Set RERANK_BINDING to cohere/jina/openai/etc.')
+            rerank_model_func = None
+        else:
+            # Use unified rerank factory for all API-based rerankers
+            from lightrag.rerank import create_rerank_func
 
-            rerank_api_key = os.getenv('RERANK_BINDING_API_KEY') or os.getenv('DEEPINFRA_API_KEY')
-            base_url = os.getenv('RERANK_BINDING_HOST', 'https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B')
-            model = os.getenv('RERANK_MODEL', 'Qwen/Qwen3-Reranker-8B')
-
-            async def rerank_func(query, documents, top_n=None, **kwargs):
-                return await deepinfra_rerank(query, documents, top_n, rerank_api_key, model, base_url)
-
-            rerank_model_func = rerank_func
-            logger.info(f'DeepInfra reranking enabled: {model}')
-
-        elif rerank_binding == 'jina':
-            from lightrag.rerank import jina_rerank
-
-            rerank_api_key = os.getenv('RERANK_BINDING_API_KEY') or os.getenv('JINA_API_KEY')
-            base_url = os.getenv('RERANK_BINDING_HOST', 'https://api.jina.ai/v1/rerank')
-            model = os.getenv('RERANK_MODEL', 'jina-reranker-v2-base-multilingual')
-
-            async def rerank_func(query, documents, top_n=None, **kwargs):
-                return await jina_rerank(query, documents, top_n, rerank_api_key, model, base_url)
-
-            rerank_model_func = rerank_func
-            logger.info(f'Jina reranking enabled: {model}')
-
-        elif rerank_binding == 'cohere':
-            from lightrag.rerank import cohere_rerank
-
-            rerank_api_key = os.getenv('RERANK_BINDING_API_KEY') or os.getenv('COHERE_API_KEY')
-            base_url = os.getenv('RERANK_BINDING_HOST', 'https://api.cohere.com/v2/rerank')
-            model = os.getenv('RERANK_MODEL', 'rerank-v3.5')
-
-            async def rerank_func(query, documents, top_n=None, **kwargs):
-                return await cohere_rerank(query, documents, top_n, rerank_api_key, model, base_url)
-
-            rerank_model_func = rerank_func
-            logger.info(f'Cohere reranking enabled: {model}')
-
-        elif rerank_binding == 'aliyun':
-            from lightrag.rerank import ali_rerank
-
-            rerank_api_key = os.getenv('RERANK_BINDING_API_KEY') or os.getenv('DASHSCOPE_API_KEY')
-            base_url = os.getenv(
-                'RERANK_BINDING_HOST', 'https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank'
-            )
-            model = os.getenv('RERANK_MODEL', 'gte-rerank-v2')
-
-            async def rerank_func(query, documents, top_n=None, **kwargs):
-                return await ali_rerank(query, documents, top_n, rerank_api_key, model, base_url)
-
-            rerank_model_func = rerank_func
-            logger.info(f'Aliyun reranking enabled: {model}')
-
-        else:  # local
-            from lightrag.rerank import DEFAULT_RERANK_MODEL, create_local_rerank_func
-
-            model_name = args.rerank_model or DEFAULT_RERANK_MODEL
             try:
-                rerank_model_func = create_local_rerank_func(model_name)
-                logger.info(f'Local reranking enabled with model: {model_name}')
+                rerank_model_func = create_rerank_func(binding=rerank_binding)
             except Exception as e:
-                logger.error(f'Failed to initialize local reranker: {e}')
+                logger.error(f'Failed to initialize reranker: {e}')
                 logger.warning('Continuing without reranking')
                 rerank_model_func = None
     else:

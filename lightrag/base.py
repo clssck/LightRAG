@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+import os
 from typing import (
     Any,
     Literal,
@@ -364,6 +364,13 @@ class BaseVectorStorage(StorageNameSpace, ABC):
     embedding_func: EmbeddingFunc
     cosine_better_than_threshold: float = field(default=0.2)
     meta_fields: set[str] = field(default_factory=set)
+
+    def __post_init__(self):
+        """Validate required embedding_func for vector storage."""
+        if self.embedding_func is None:
+            raise ValueError(
+                'embedding_func is required for vector storage. Please provide a valid EmbeddingFunc instance.'
+            )
 
     @abstractmethod
     async def query(self, query: str, top_k: int, query_embedding: list[float] | None = None) -> list[dict[str, Any]]:

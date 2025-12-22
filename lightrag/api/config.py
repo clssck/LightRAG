@@ -34,8 +34,6 @@ from lightrag.constants import (
     DEFAULT_WOKERS,
 )
 from lightrag.llm.binding_options import (
-    GeminiEmbeddingOptions,
-    GeminiLLMOptions,
     OllamaEmbeddingOptions,
     OllamaLLMOptions,
     OpenAILLMOptions,
@@ -62,10 +60,7 @@ class DefaultRAGStorageConfig:
 def get_default_host(binding_type: str) -> str:
     default_hosts = {
         'ollama': os.getenv('LLM_BINDING_HOST', 'http://localhost:11434'),
-        'lollms': os.getenv('LLM_BINDING_HOST', 'http://localhost:9600'),
-        'azure_openai': os.getenv('AZURE_OPENAI_ENDPOINT', 'https://api.openai.com/v1'),
         'openai': os.getenv('LLM_BINDING_HOST', 'https://api.openai.com/v1'),
-        'gemini': os.getenv('LLM_BINDING_HOST', 'https://generativelanguage.googleapis.com'),
     }
     return default_hosts.get(
         binding_type, os.getenv('LLM_BINDING_HOST', 'http://localhost:11434')
@@ -219,13 +214,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=get_env_value('LLM_BINDING', 'ollama'),
         choices=[
-            'lollms',
             'ollama',
             'openai',
             'openai-ollama',
-            'azure_openai',
-            'aws_bedrock',
-            'gemini',
         ],
         help='LLM binding type (default: from env or ollama)',
     )
@@ -234,13 +225,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=get_env_value('EMBEDDING_BINDING', 'ollama'),
         choices=[
-            'lollms',
             'ollama',
             'openai',
-            'azure_openai',
-            'aws_bedrock',
-            'jina',
-            'gemini',
         ],
         help='Embedding binding type (default: from env or ollama)',
     )
@@ -274,43 +260,23 @@ def parse_args() -> argparse.Namespace:
     if '--embedding-binding' in sys.argv:
         try:
             idx = sys.argv.index('--embedding-binding')
-            if idx + 1 < len(sys.argv):
-                if sys.argv[idx + 1] == 'ollama':
-                    OllamaEmbeddingOptions.add_args(parser)
-                elif sys.argv[idx + 1] == 'gemini':
-                    GeminiEmbeddingOptions.add_args(parser)
+            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] == 'ollama':
+                OllamaEmbeddingOptions.add_args(parser)
         except IndexError:
             pass
-    else:
-        env_embedding_binding = os.environ.get('EMBEDDING_BINDING')
-        if env_embedding_binding == 'ollama':
-            OllamaEmbeddingOptions.add_args(parser)
-        elif env_embedding_binding == 'gemini':
-            GeminiEmbeddingOptions.add_args(parser)
+    elif os.environ.get('EMBEDDING_BINDING') == 'ollama':
+        OllamaEmbeddingOptions.add_args(parser)
 
-    # Add OpenAI LLM options when llm-binding is openai or azure_openai
+    # Add OpenAI LLM options when llm-binding is openai
     if '--llm-binding' in sys.argv:
         try:
             idx = sys.argv.index('--llm-binding')
-            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] in [
-                'openai',
-                'azure_openai',
-            ]:
+            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] == 'openai':
                 OpenAILLMOptions.add_args(parser)
         except IndexError:
             pass
-    elif os.environ.get('LLM_BINDING') in ['openai', 'azure_openai']:
+    elif os.environ.get('LLM_BINDING') == 'openai':
         OpenAILLMOptions.add_args(parser)
-
-    if '--llm-binding' in sys.argv:
-        try:
-            idx = sys.argv.index('--llm-binding')
-            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] == 'gemini':
-                GeminiLLMOptions.add_args(parser)
-        except IndexError:
-            pass
-    elif os.environ.get('LLM_BINDING') == 'gemini':
-        GeminiLLMOptions.add_args(parser)
 
     args, _unknown = parser.parse_known_args()
 
@@ -346,7 +312,7 @@ def parse_args() -> argparse.Namespace:
     # Inject model configuration
     args.llm_model = get_env_value('LLM_MODEL', 'mistral-nemo:latest')
     # EMBEDDING_MODEL defaults to None - each binding will use its own default model
-    # e.g., OpenAI uses "text-embedding-3-small", Jina uses "jina-embeddings-v4"
+    # e.g., OpenAI uses "text-embedding-3-small", Ollama uses "bge-m3:latest"
     args.embedding_model = get_env_value('EMBEDDING_MODEL', None, special_none=True)
     # EMBEDDING_DIM defaults to None - each binding will use its own default dimension
     # Value is inherited from provider defaults via wrap_embedding_func_with_attrs decorator

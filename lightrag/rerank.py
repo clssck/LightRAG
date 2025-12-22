@@ -19,14 +19,108 @@ from .utils import TiktokenTokenizer, logger
 # the OS environment variables take precedence over the .env file
 load_dotenv(dotenv_path='.env', override=False)
 
-# Stub for server compatibility - local reranking disabled, use API rerankers
-DEFAULT_RERANK_MODEL = 'jina-reranker-v2-base-multilingual'
+# Default model for reranking
+DEFAULT_RERANK_MODEL = 'rerank-v3.5'
+
+# Provider configurations: (default_base_url, request_format, response_format)
+RERANK_PROVIDERS = {
+    'cohere': ('https://api.cohere.com/v2/rerank', 'standard', 'standard'),
+    'jina': ('https://api.jina.ai/v1/rerank', 'standard', 'standard'),
+    'aliyun': ('https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank', 'aliyun', 'aliyun'),
+    'deepinfra': ('https://api.deepinfra.com/v1/inference/Qwen/Qwen3-Reranker-8B', 'deepinfra', 'deepinfra'),
+    # Generic OpenAI-compatible (same as cohere format)
+    'openai': ('https://api.openai.com/v1/rerank', 'standard', 'standard'),
+}
 
 
 def create_local_rerank_func(model_name: str | None = None):
     """Stub - local reranking disabled. Use RERANK_BINDING env vars for API reranking."""
-    logger.warning('Local reranking disabled. Use RERANK_BINDING=jina/cohere/aliyun for API reranking.')
+    logger.warning('Local reranking disabled. Use RERANK_BINDING env var for API reranking.')
     return None
+
+
+def create_rerank_func(
+    binding: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    enable_chunking: bool = False,
+    max_tokens_per_doc: int = 480,
+):
+    """
+    Factory function to create a rerank function based on configuration.
+
+    This provides a unified interface for all rerank providers. Configuration
+    can be passed directly or read from environment variables.
+
+    Args:
+        binding: Provider binding (cohere, jina, aliyun, deepinfra, openai).
+                 Falls back to RERANK_BINDING env var.
+        model: Model name. Falls back to RERANK_MODEL env var.
+        base_url: API endpoint. Falls back to RERANK_BINDING_HOST env var
+                  or provider default.
+        api_key: API key. Falls back to RERANK_BINDING_API_KEY or
+                 provider-specific env var (e.g., COHERE_API_KEY).
+        enable_chunking: Whether to chunk long documents.
+        max_tokens_per_doc: Max tokens per document for chunking.
+
+    Returns:
+        Async function: rerank(query, documents, top_n=None) -> list[dict]
+
+    Example:
+        >>> rerank_func = create_rerank_func(binding='cohere')
+        >>> results = await rerank_func("What is Python?", ["Doc1", "Doc2"])
+    """
+    # Resolve configuration from args or env vars
+    binding = (binding or os.getenv('RERANK_BINDING', 'cohere')).lower()
+    model = model or os.getenv('RERANK_MODEL', DEFAULT_RERANK_MODEL)
+
+    # Get provider defaults
+    provider_config = RERANK_PROVIDERS.get(binding, RERANK_PROVIDERS['cohere'])
+    default_url, request_format, response_format = provider_config
+
+    base_url = base_url or os.getenv('RERANK_BINDING_HOST', default_url)
+
+    # API key: try provider-specific env var, then generic
+    if api_key is None:
+        provider_key_map = {
+            'cohere': 'COHERE_API_KEY',
+            'jina': 'JINA_API_KEY',
+            'aliyun': 'DASHSCOPE_API_KEY',
+            'deepinfra': 'DEEPINFRA_API_KEY',
+            'openai': 'OPENAI_API_KEY',
+        }
+        provider_key_env = provider_key_map.get(binding, 'OPENAI_API_KEY')
+        api_key = os.getenv('RERANK_BINDING_API_KEY') or os.getenv(provider_key_env)
+
+    logger.info(f'Reranking configured: binding={binding}, model={model}, url={base_url}')
+
+    # Create the rerank function closure
+    async def rerank_func(query: str, documents: list[str], top_n: int | None = None, **kwargs):
+        if request_format == 'deepinfra':
+            return await deepinfra_rerank(
+                query=query,
+                documents=documents,
+                top_n=top_n,
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+            )
+        else:
+            return await generic_rerank_api(
+                query=query,
+                documents=documents,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                top_n=top_n,
+                request_format=request_format,
+                response_format=response_format,
+                enable_chunking=enable_chunking,
+                max_tokens_per_doc=max_tokens_per_doc,
+            )
+
+    return rerank_func
 
 
 def chunk_documents_for_rerank(
@@ -350,154 +444,6 @@ async def generic_rerank_api(
             return standardized_results
 
 
-async def cohere_rerank(
-    query: str,
-    documents: list[str],
-    top_n: int | None = None,
-    api_key: str | None = None,
-    model: str = 'rerank-v3.5',
-    base_url: str = 'https://api.cohere.com/v2/rerank',
-    extra_body: dict[str, Any] | None = None,
-    enable_chunking: bool = False,
-    max_tokens_per_doc: int = 4096,
-) -> list[dict[str, Any]]:
-    """
-    Rerank documents using Cohere API.
-
-    Supports both standard Cohere API and Cohere-compatible proxies
-
-    Args:
-        query: The search query
-        documents: List of strings to rerank
-        top_n: Number of top results to return
-        api_key: API key for authentication
-        model: rerank model name (default: rerank-v3.5)
-        base_url: API endpoint
-        extra_body: Additional body for http request(reserved for extra params)
-        enable_chunking: Whether to chunk documents exceeding max_tokens_per_doc
-        max_tokens_per_doc: Maximum tokens per document (default: 4096 for Cohere v3.5)
-
-    Returns:
-        List of dictionary of ["index": int, "relevance_score": float]
-
-    Example:
-        >>> # Standard Cohere API
-        >>> results = await cohere_rerank(
-        ...     query="What is the meaning of life?",
-        ...     documents=["Doc1", "Doc2"],
-        ...     api_key="your-cohere-key"
-        ... )
-
-        >>> # LiteLLM proxy with user authentication
-        >>> results = await cohere_rerank(
-        ...     query="What is vector search?",
-        ...     documents=["Doc1", "Doc2"],
-        ...     model="answerai-colbert-small-v1",
-        ...     base_url="https://llm-proxy.example.com/v2/rerank",
-        ...     api_key="your-proxy-key",
-        ...     enable_chunking=True,
-        ...     max_tokens_per_doc=480
-        ... )
-    """
-    if api_key is None:
-        api_key = os.getenv('COHERE_API_KEY') or os.getenv('RERANK_BINDING_API_KEY')
-
-    return await generic_rerank_api(
-        query=query,
-        documents=documents,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        top_n=top_n,
-        return_documents=None,  # Cohere doesn't support this parameter
-        extra_body=extra_body,
-        response_format='standard',
-        enable_chunking=enable_chunking,
-        max_tokens_per_doc=max_tokens_per_doc,
-    )
-
-
-async def jina_rerank(
-    query: str,
-    documents: list[str],
-    top_n: int | None = None,
-    api_key: str | None = None,
-    model: str = 'jina-reranker-v2-base-multilingual',
-    base_url: str = 'https://api.jina.ai/v1/rerank',
-    extra_body: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Rerank documents using Jina AI API.
-
-    Args:
-        query: The search query
-        documents: List of strings to rerank
-        top_n: Number of top results to return
-        api_key: API key
-        model: rerank model name
-        base_url: API endpoint
-        extra_body: Additional body for http request(reserved for extra params)
-
-    Returns:
-        List of dictionary of ["index": int, "relevance_score": float]
-    """
-    if api_key is None:
-        api_key = os.getenv('JINA_API_KEY') or os.getenv('RERANK_BINDING_API_KEY')
-
-    return await generic_rerank_api(
-        query=query,
-        documents=documents,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        top_n=top_n,
-        return_documents=False,
-        extra_body=extra_body,
-        response_format='standard',
-    )
-
-
-async def ali_rerank(
-    query: str,
-    documents: list[str],
-    top_n: int | None = None,
-    api_key: str | None = None,
-    model: str = 'gte-rerank-v2',
-    base_url: str = 'https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank',
-    extra_body: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """
-    Rerank documents using Aliyun DashScope API.
-
-    Args:
-        query: The search query
-        documents: List of strings to rerank
-        top_n: Number of top results to return
-        api_key: Aliyun API key
-        model: rerank model name
-        base_url: API endpoint
-        extra_body: Additional body for http request(reserved for extra params)
-
-    Returns:
-        List of dictionary of ["index": int, "relevance_score": float]
-    """
-    if api_key is None:
-        api_key = os.getenv('DASHSCOPE_API_KEY') or os.getenv('RERANK_BINDING_API_KEY')
-
-    return await generic_rerank_api(
-        query=query,
-        documents=documents,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        top_n=top_n,
-        return_documents=False,  # Aliyun doesn't need this parameter
-        extra_body=extra_body,
-        response_format='aliyun',
-        request_format='aliyun',
-    )
-
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=60),
@@ -590,49 +536,16 @@ if __name__ == '__main__':
 
         query = 'What is the capital of France?'
 
-        # Test Jina rerank
+        # Use the configured reranker (reads from env vars)
         try:
-            print('=== Jina Rerank ===')
-            result = await jina_rerank(
-                query=query,
-                documents=docs,
-                top_n=2,
-            )
+            print('=== Rerank via create_rerank_func() ===')
+            rerank_func = create_rerank_func()
+            result = await rerank_func(query=query, documents=docs, top_n=2)
             print('Results:')
             for item in result:
                 print(f'Index: {item["index"]}, Score: {item["relevance_score"]:.4f}')
                 print(f'Document: {docs[item["index"]]}')
         except Exception as e:
-            print(f'Jina Error: {e}')
-
-        # Test Cohere rerank
-        try:
-            print('\n=== Cohere Rerank ===')
-            result = await cohere_rerank(
-                query=query,
-                documents=docs,
-                top_n=2,
-            )
-            print('Results:')
-            for item in result:
-                print(f'Index: {item["index"]}, Score: {item["relevance_score"]:.4f}')
-                print(f'Document: {docs[item["index"]]}')
-        except Exception as e:
-            print(f'Cohere Error: {e}')
-
-        # Test Aliyun rerank
-        try:
-            print('\n=== Aliyun Rerank ===')
-            result = await ali_rerank(
-                query=query,
-                documents=docs,
-                top_n=2,
-            )
-            print('Results:')
-            for item in result:
-                print(f'Index: {item["index"]}, Score: {item["relevance_score"]:.4f}')
-                print(f'Document: {docs[item["index"]]}')
-        except Exception as e:
-            print(f'Aliyun Error: {e}')
+            print(f'Error: {e}')
 
     asyncio.run(main())

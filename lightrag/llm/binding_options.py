@@ -6,9 +6,9 @@ bindings and integrations.
 """
 
 import argparse
-import json
 from argparse import ArgumentParser, Namespace
 from dataclasses import asdict, dataclass, field
+import json
 from typing import Any, ClassVar, cast, get_args, get_origin
 
 from lightrag.constants import DEFAULT_TEMPERATURE
@@ -447,55 +447,6 @@ class OllamaLLMOptions(_OllamaOptionsMixin, BindingOptions):
 
     # mandatory name of binding
     _binding_name: ClassVar[str] = 'ollama_llm'
-
-
-# =============================================================================
-# Binding Options for Gemini
-# =============================================================================
-@dataclass
-class GeminiLLMOptions(BindingOptions):
-    """Options for Google Gemini models."""
-
-    _binding_name: ClassVar[str] = 'gemini_llm'
-
-    temperature: float = DEFAULT_TEMPERATURE
-    top_p: float = 0.95
-    top_k: int = 40
-    max_output_tokens: int | None = None
-    candidate_count: int = 1
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
-    stop_sequences: list[str] = field(default_factory=list)
-    seed: int | None = None
-    thinking_config: dict | None = None
-    safety_settings: dict | None = None
-
-    _help: ClassVar[dict[str, str]] = {
-        'temperature': 'Controls randomness (0.0-2.0, higher = more creative)',
-        'top_p': 'Nucleus sampling parameter (0.0-1.0)',
-        'top_k': 'Limits sampling to the top K tokens (1 disables the limit)',
-        'max_output_tokens': 'Maximum tokens generated in the response',
-        'candidate_count': 'Number of candidates returned per request',
-        'presence_penalty': 'Penalty for token presence (-2.0 to 2.0)',
-        'frequency_penalty': 'Penalty for token frequency (-2.0 to 2.0)',
-        'stop_sequences': 'Stop sequences (JSON array of strings, e.g., \'["END"]\')',
-        'seed': 'Random seed for reproducible generation (leave empty for random)',
-        'thinking_config': 'Thinking configuration (JSON dict, e.g., \'{"thinking_budget": 1024}\' or \'{"include_thoughts": true}\')',
-        'safety_settings': 'JSON object with Gemini safety settings overrides',
-    }
-
-
-@dataclass
-class GeminiEmbeddingOptions(BindingOptions):
-    """Options for Google Gemini embedding models."""
-
-    _binding_name: ClassVar[str] = 'gemini_embedding'
-
-    task_type: str = 'RETRIEVAL_DOCUMENT'
-
-    _help: ClassVar[dict[str, str]] = {
-        'task_type': 'Task type for embedding optimization (RETRIEVAL_DOCUMENT, RETRIEVAL_QUERY, SEMANTIC_SIMILARITY, CLASSIFICATION, CLUSTERING, CODE_RETRIEVAL_QUERY, QUESTION_ANSWERING, FACT_VERIFICATION)',
-    }
 
 
 # =============================================================================

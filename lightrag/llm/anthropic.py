@@ -1,6 +1,6 @@
+from collections.abc import AsyncIterator
 import logging
 import os
-from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import numpy as np

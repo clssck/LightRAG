@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+# Mark all tests in this module as offline (no external dependencies)
+pytestmark = pytest.mark.offline
+
 from lightrag.document import KREUZBERG_AVAILABLE, is_kreuzberg_available
 
 

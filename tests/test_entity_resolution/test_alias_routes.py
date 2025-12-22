@@ -11,6 +11,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+# Mark all tests in this module as offline (no external dependencies)
+pytestmark = pytest.mark.offline
+
 # Import after conftest.py has mocked the config modules
 
 # --- Mock Fixtures ---
@@ -577,8 +580,10 @@ class TestDatabaseErrorHandling:
 
         response = client.get('/aliases')
 
-        # Should handle None gracefully - either 200 with defaults or 500
-        assert response.status_code in [200, 500]
+        # Implementation handles None gracefully with: count_result.get('total', 0) if count_result else 0
+        assert response.status_code == 200
+        data = response.json()
+        assert data['total'] == 0
 
     def test_handles_malformed_query_result(self, mock_rag_with_db_errors):
         """Handle malformed query results (missing expected keys)."""
@@ -595,5 +600,7 @@ class TestDatabaseErrorHandling:
 
         response = client.get('/aliases')
 
-        # Should handle missing key gracefully
-        assert response.status_code in [200, 500]
+        # .get('total', 0) handles missing key by returning 0
+        assert response.status_code == 200
+        data = response.json()
+        assert data['total'] == 0
