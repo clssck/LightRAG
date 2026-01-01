@@ -2,9 +2,16 @@
 Utility functions for the LightRAG API.
 """
 
+from __future__ import annotations
+
 import argparse
+import asyncio
+import functools
 import os
 import sys
+import traceback
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar, cast
 
 from ascii_colors import ASCIIColors
 from fastapi import HTTPException, Request, Security, status
@@ -13,12 +20,70 @@ from starlette.status import HTTP_403_FORBIDDEN
 
 from lightrag import __version__ as core_version
 from lightrag.api import __api_version__ as api_version
-from lightrag.constants import (
-    DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
-)
+from lightrag.constants import DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE
+from lightrag.utils import logger
 
 from .auth import auth_handler
 from .config import get_env_value, global_args
+
+P = ParamSpec('P')
+T = TypeVar('T')
+
+
+def handle_api_error(operation: str | None = None) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    """
+    Decorator to handle API route errors consistently.
+
+    Catches exceptions, logs them with traceback, and raises HTTPException.
+    HTTPException instances are re-raised as-is to preserve status codes.
+
+    Args:
+        operation: Optional description of the operation for error messages.
+                  If not provided, uses the function name.
+
+    Usage:
+        @router.get('/items')
+        @handle_api_error('fetching items')
+        async def get_items():
+            ...
+
+        @router.post('/items')
+        @handle_api_error()  # Will use 'create_item' as operation name
+        async def create_item():
+            ...
+    """
+
+    def decorator(func: Callable[P, T]) -> Callable[P, T]:
+        op_name = operation or func.__name__
+
+        @functools.wraps(func)
+        async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            try:
+                return await func(*args, **kwargs)
+            except HTTPException:
+                # Re-raise HTTPException to preserve status codes (4xx, etc.)
+                raise
+            except Exception as e:
+                logger.error(f'Error {op_name}: {e!s}')
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+        @functools.wraps(func)
+        def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            try:
+                return func(*args, **kwargs)
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f'Error {op_name}: {e!s}')
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+        if asyncio.iscoroutinefunction(func):
+            return cast(Callable[P, T], async_wrapper)
+        return cast(Callable[P, T], sync_wrapper)
+
+    return decorator
 
 
 def check_env_file():

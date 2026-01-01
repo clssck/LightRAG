@@ -328,21 +328,19 @@ async def openai_complete_if_cache(
             response = await openai_async_client.chat.completions.create(
                 model=api_model, messages=typed_messages, **kwargs
             )
-    except APITimeoutError as e:
-        logger.error(f'OpenAI API Timeout Error: {e}')
-        await openai_async_client.close()  # Ensure client is closed
-        raise
-    except APIConnectionError as e:
-        logger.error(f'OpenAI API Connection Error: {e}')
-        await openai_async_client.close()  # Ensure client is closed
-        raise
-    except RateLimitError as e:
-        logger.error(f'OpenAI API Rate Limit Error: {e}')
-        await openai_async_client.close()  # Ensure client is closed
+    except (APITimeoutError, APIConnectionError, RateLimitError) as e:
+        # Log specific error type for known API errors
+        error_names = {
+            APITimeoutError: 'Timeout',
+            APIConnectionError: 'Connection',
+            RateLimitError: 'Rate Limit',
+        }
+        logger.error(f'OpenAI API {error_names[type(e)]} Error: {e}')
+        await openai_async_client.close()
         raise
     except Exception as e:
         logger.error(f'OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}')
-        await openai_async_client.close()  # Ensure client is closed
+        await openai_async_client.close()
         raise
 
     if hasattr(response, '__aiter__'):

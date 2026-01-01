@@ -7,6 +7,7 @@ This module provides endpoints for:
 - Getting presigned URLs
 """
 
+import asyncio
 import mimetypes
 from typing import Annotated
 
@@ -302,9 +303,8 @@ def create_upload_routes(
             if not to_delete:
                 raise HTTPException(status_code=404, detail='Document not found in staging')
 
-            # Delete each object
-            for key in to_delete:
-                await s3_client.delete_object(key)
+            # Delete objects in parallel
+            await asyncio.gather(*[s3_client.delete_object(key) for key in to_delete])
 
             return {
                 'status': 'deleted',

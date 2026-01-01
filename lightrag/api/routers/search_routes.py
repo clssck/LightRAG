@@ -15,9 +15,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.utils_api import get_combined_auth_dependency, handle_api_error
 from lightrag.kg.postgres_impl import PostgreSQLDB
-from lightrag.utils import logger
 
 
 class SearchResult(BaseModel):
@@ -119,6 +118,7 @@ def create_search_routes(
         - /search: Keyword search -> Direct chunk results (no LLM)
         """,
     )
+    @handle_api_error('performing BM25 search')
     async def search(
         q: Annotated[str, Query(description='Search query', min_length=1)],
         limit: Annotated[int, Query(description='Max results to return', ge=1, le=100)] = 10,
@@ -126,41 +126,34 @@ def create_search_routes(
         _: Annotated[bool, Depends(optional_api_key)] = True,
     ) -> SearchResponse:
         """Perform BM25 full-text search on chunks."""
-        try:
-            db = get_db()
-            results = await db.full_text_search(
-                query=q,
-                workspace=workspace,
-                limit=limit,
+        db = get_db()
+        results = await db.full_text_search(
+            query=q,
+            workspace=workspace,
+            limit=limit,
+        )
+
+        search_results = [
+            SearchResult(
+                id=r.get('id', ''),
+                full_doc_id=r.get('full_doc_id', ''),
+                chunk_order_index=r.get('chunk_order_index', 0),
+                tokens=r.get('tokens', 0),
+                content=r.get('content', ''),
+                file_path=r.get('file_path'),
+                s3_key=r.get('s3_key'),
+                char_start=r.get('char_start'),
+                char_end=r.get('char_end'),
+                score=float(r.get('score', 0)),
             )
+            for r in results
+        ]
 
-            search_results = [
-                SearchResult(
-                    id=r.get('id', ''),
-                    full_doc_id=r.get('full_doc_id', ''),
-                    chunk_order_index=r.get('chunk_order_index', 0),
-                    tokens=r.get('tokens', 0),
-                    content=r.get('content', ''),
-                    file_path=r.get('file_path'),
-                    s3_key=r.get('s3_key'),
-                    char_start=r.get('char_start'),
-                    char_end=r.get('char_end'),
-                    score=float(r.get('score', 0)),
-                )
-                for r in results
-            ]
-
-            return SearchResponse(
-                query=q,
-                results=search_results,
-                count=len(search_results),
-                workspace=workspace,
-            )
-
-        except Exception as e:
-            if isinstance(e, HTTPException):
-                raise
-            logger.error('Search failed: %s', e)
-            raise HTTPException(status_code=500, detail=f'Search failed: {e}') from e
+        return SearchResponse(
+            query=q,
+            results=search_results,
+            count=len(search_results),
+            workspace=workspace,
+        )
 
     return router

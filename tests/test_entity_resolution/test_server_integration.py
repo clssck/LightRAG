@@ -276,11 +276,11 @@ class TestConfigPropagation:
 
         from lightrag.entity_resolution.config import EntityResolutionConfig
 
-        # Create config as server would
+        # Create config as server would (LLM-only approach)
         config = EntityResolutionConfig(
             enabled=True,
-            fuzzy_threshold=0.9,
-            abbreviation_detection_enabled=True,
+            min_confidence=0.9,
+            batch_size=30,
         )
 
         # Convert as LightRAG class does
@@ -298,5 +298,5 @@ class TestConfigPropagation:
         reconstructed = EntityResolutionConfig(**config_payload)
 
         assert reconstructed.enabled is True
-        assert reconstructed.fuzzy_threshold == 0.9
-        assert reconstructed.abbreviation_detection_enabled is True
+        assert reconstructed.min_confidence == 0.9
+        assert reconstructed.batch_size == 30

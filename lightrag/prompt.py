@@ -498,3 +498,72 @@ PROMPTS['hyde_prompt'] = """You are a knowledgeable assistant. Given the followi
 Question: {query}
 
 Write a concise 2-3 sentence hypothetical answer that contains the key information someone asking this question would want to find:"""
+
+# Entity Review prompt for LLM-based entity resolution
+# Used to determine if entity pairs refer to the same real-world entity
+PROMPTS['entity_review_system_prompt'] = """You are an Entity Resolution Specialist. Your task is to determine whether pairs of entity names refer to the same real-world entity.
+
+---Guidelines---
+
+**DO merge entities that are:**
+- Abbreviations: "FDA" = "US Food and Drug Administration"
+- Alternate names: "The Fed" = "Federal Reserve"
+- Translations: "美联储" = "Federal Reserve"
+- Typos/misspellings: "Dupixant" = "Dupixent"
+- Name variations: "Jerome Powell" = "Fed Chair Powell"
+- Shortened forms: "United States" = "United States of America"
+
+**DO NOT merge entities that are:**
+- Similar but distinct: "Method 1" ≠ "Method 2"
+- Parent/child concepts: "United States" ≠ "United States Stock Market"
+- Related but different: "Apple Inc" ≠ "Apple Watch"
+- Different instances: "Super Bowl LV" ≠ "Super Bowl LVI"
+- Different semantic types: A fruit ≠ an organization
+  Example: "apple" (fruit) ≠ "Apple Inc." (organization)
+  Example: "Amazon" (river) ≠ "Amazon.com" (company)
+- Type-mismatched entities: Always verify entity types match before confirming alias
+
+---Output Format---
+
+For each pair, return a JSON object with:
+- pair_id: The pair number (1-indexed)
+- same_entity: true/false
+- canonical: The preferred/canonical name (if same_entity=true, use the most complete/formal name)
+- confidence: 0.0-1.0 (how certain you are)
+- reasoning: Brief explanation of your decision
+
+Return a JSON array of all results."""
+
+PROMPTS['entity_review_user_prompt'] = """---Task---
+Review the following entity pairs and determine which refer to the same real-world entity.
+
+---Entity Pairs---
+{pairs}
+
+---Output---
+Return a JSON array with your analysis for each pair. Example format:
+[
+  {{"pair_id": 1, "same_entity": true, "canonical": "Federal Reserve", "confidence": 0.95, "reasoning": "FRB is the official abbreviation for Federal Reserve Board"}},
+  {{"pair_id": 2, "same_entity": false, "canonical": null, "confidence": 0.9, "reasoning": "These are distinct concepts - one is a country, the other is a financial market"}}
+]"""
+
+# Entity batch review prompt for reviewing multiple new entities against existing ones
+PROMPTS['entity_batch_review_prompt'] = """---Task---
+You have a list of NEW entities extracted from a document. For each new entity, I will provide candidate EXISTING entities that may be the same.
+
+Your job: Determine if each new entity matches any of its candidates.
+
+---New Entities and Candidates---
+{entity_candidates}
+
+---Output Format---
+Return a JSON array. For each new entity:
+{{
+  "new_entity": "<the new entity name>",
+  "matches_existing": true/false,
+  "canonical": "<existing entity name if match, else the new entity name>",
+  "confidence": 0.0-1.0,
+  "reasoning": "<brief explanation>"
+}}
+
+Only set matches_existing=true if you are confident they refer to the same real-world entity."""

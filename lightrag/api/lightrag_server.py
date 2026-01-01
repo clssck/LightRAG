@@ -468,15 +468,21 @@ def create_app(args):
     def create_entity_resolution_config(args) -> 'EntityResolutionConfig':
         """
         Create EntityResolutionConfig from command line/env arguments.
+
+        Entity resolution uses LLM-based approach:
+        1. Cache check first (instant, free)
+        2. VDB similarity search for candidates
+        3. LLM batch review for decisions
         """
         if not args.entity_resolution_enabled:
-            return EntityResolutionConfig(enabled=False, max_candidates=0)
+            return EntityResolutionConfig(enabled=False)
 
         return EntityResolutionConfig(
             enabled=True,
-            fuzzy_threshold=args.entity_resolution_fuzzy_threshold,
-            vector_threshold=args.entity_resolution_vector_threshold,
-            max_candidates=args.entity_resolution_max_candidates,
+            batch_size=args.entity_resolution_batch_size,
+            candidates_per_entity=args.entity_resolution_candidates_per_entity,
+            min_confidence=args.entity_resolution_min_confidence,
+            auto_apply=args.entity_resolution_auto_apply,
         )
 
     def create_optimized_embedding_function(
@@ -855,7 +861,7 @@ def create_app(args):
             try:
                 pipeline_status = await get_namespace_data('pipeline_status', workspace=workspace)
                 pipeline_busy = pipeline_status.get('busy', False)
-            except Exception:
+            except (KeyError, AttributeError, RuntimeError):
                 # Pipeline not yet initialized - worker still starting up
                 pipeline_busy = None  # Will show as null in response
 
@@ -1002,6 +1008,9 @@ def configure_logging():
     log_max_bytes = get_env_value('LOG_MAX_BYTES', DEFAULT_LOG_MAX_BYTES, int)
     log_backup_count = get_env_value('LOG_BACKUP_COUNT', DEFAULT_LOG_BACKUP_COUNT, int)
 
+    # Get log level from environment variable
+    log_level = os.getenv('LOG_LEVEL', 'INFO')
+
     logging.config.dictConfig(
         cast(
             dict[str, Any],
@@ -1035,23 +1044,23 @@ def configure_logging():
                     # Configure all uvicorn related loggers
                     'uvicorn': {
                         'handlers': ['console', 'file'],
-                        'level': 'INFO',
+                        'level': log_level,
                         'propagate': False,
                     },
                     'uvicorn.access': {
                         'handlers': ['console', 'file'],
-                        'level': 'INFO',
+                        'level': log_level,
                         'propagate': False,
                         'filters': ['path_filter'],
                     },
                     'uvicorn.error': {
                         'handlers': ['console', 'file'],
-                        'level': 'INFO',
+                        'level': log_level,
                         'propagate': False,
                     },
                     'lightrag': {
                         'handlers': ['console', 'file'],
-                        'level': 'INFO',
+                        'level': log_level,
                         'propagate': False,
                         'filters': ['path_filter'],
                     },

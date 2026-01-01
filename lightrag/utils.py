@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import traceback
+import unicodedata
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
@@ -283,8 +284,8 @@ class LightragPathFilter(logging.Filter):
                 and (status == 200 or status == 304)
                 and path in self.filtered_paths
             )
-        except Exception:
-            # In case of any error, let the message through
+        except (AttributeError, TypeError, IndexError, KeyError):
+            # In case of any error accessing record.args, let the message through
             return True
 
 
@@ -1499,6 +1500,48 @@ def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
         return new_loop
 
 
+def sync_wrapper(async_method_name: str | None = None):
+    """Create a synchronous wrapper for an async method.
+
+    This decorator reduces code duplication by automatically creating sync
+    wrappers that delegate to their async counterparts using the event loop.
+
+    Args:
+        async_method_name: Name of the async method to wrap. If None, auto-detects
+            by prepending 'a' to the decorated method name (e.g., 'insert' -> 'ainsert').
+
+    Usage:
+        class MyClass:
+            async def ainsert(self, data: str) -> bool:
+                '''Insert data asynchronously.'''
+                ...
+
+            @sync_wrapper()  # Auto-detects 'ainsert' from 'insert'
+            def insert(self, data: str) -> bool:
+                '''Sync version of :meth:`ainsert`.'''
+
+            @sync_wrapper('acustom_async')  # Explicit target
+            def custom_sync(self, data: str) -> bool:
+                '''Sync version of :meth:`acustom_async`.'''
+    """
+
+    def decorator(func: Callable) -> Callable:
+        target_name = async_method_name or f'a{func.__name__}'
+
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            async_method = getattr(self, target_name)
+            loop = always_get_an_event_loop()
+            return loop.run_until_complete(async_method(*args, **kwargs))
+
+        # Store target name for introspection
+        wrapper._async_target = target_name  # type: ignore[attr-defined]
+
+        return wrapper
+
+    return decorator
+
+
 async def aexport_data(
     chunk_entity_relation_graph,
     entities_vdb,
@@ -1781,12 +1824,7 @@ def export_data(
             - txt: Plain text formatted output
         include_vector_data: Whether to include data from the vector database.
     """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
+    loop = always_get_an_event_loop()
     loop.run_until_complete(
         aexport_data(
             chunk_entity_relation_graph,
@@ -2014,6 +2052,124 @@ def get_content_summary(content: str, max_length: int = 250) -> str:
     return content[:max_length] + '...'
 
 
+# Characters to strip for security (invisible/control characters)
+# These can be used in adversarial attacks to create visually identical
+# but byte-different entity names, causing duplicate entities in the graph.
+UNICODE_SECURITY_STRIP = frozenset({
+    # === Zero-Width Characters ===
+    '\u200B',  # Zero Width Space (ZWSP)
+    '\u200C',  # Zero Width Non-Joiner (ZWNJ)
+    '\u200D',  # Zero Width Joiner (ZWJ)
+    '\u2060',  # Word Joiner
+    '\uFEFF',  # Zero Width No-Break Space / BOM
+    '\u00AD',  # Soft Hyphen
+    # === Bidirectional Formatting Controls ===
+    '\u202A',  # Left-to-Right Embedding
+    '\u202B',  # Right-to-Left Embedding
+    '\u202C',  # Pop Directional Formatting
+    '\u202D',  # Left-to-Right Override (LRO)
+    '\u202E',  # Right-to-Left Override (RLO)
+    # === Directional Isolates ===
+    '\u2066',  # Left-to-Right Isolate
+    '\u2067',  # Right-to-Left Isolate
+    '\u2068',  # First Strong Isolate
+    '\u2069',  # Pop Directional Isolate
+    # === Phase 2: Additional Attack Vectors ===
+    '\u034F',  # Combining Grapheme Joiner (CGJ) - alters grapheme boundaries
+    '\u202F',  # Narrow No-Break Space (NNBSP) - invisible space variant
+    '\u2061',  # Function Application - invisible math operator
+    '\u2062',  # Invisible Times - invisible math operator
+    '\u2063',  # Invisible Separator - invisible math operator
+    '\u2064',  # Invisible Plus - invisible math operator
+    '\uFFF9',  # Interlinear Annotation Anchor
+    '\uFFFA',  # Interlinear Annotation Separator
+    '\uFFFB',  # Interlinear Annotation Terminator
+})
+
+
+# Mathematical alphanumeric symbols that should be normalized to ASCII
+# These look identical to letters but have different Unicode codepoints
+# Example: 𝐀 (U+1D400) looks like A but is different
+# Range: U+1D400-U+1D7FF (Mathematical Alphanumeric Symbols block)
+MATH_ALPHA_RANGE = (0x1D400, 0x1D7FF)
+
+
+def _normalize_math_alphanumerics(text: str) -> str:
+    """Normalize mathematical alphanumeric symbols to ASCII equivalents.
+
+    Uses NFKC (compatibility decomposition) selectively for mathematical
+    alphanumeric ranges only, preserving legitimate Unicode like "½" in
+    entity names.
+
+    Example: "𝐀𝐩𝐩𝐥𝐞" (mathematical bold) → "Apple"
+
+    Args:
+        text: Input text that may contain mathematical alphanumerics
+
+    Returns:
+        Text with mathematical symbols normalized to ASCII
+    """
+    result = []
+    for char in text:
+        cp = ord(char)
+        # Check if in mathematical alphanumeric range
+        if MATH_ALPHA_RANGE[0] <= cp <= MATH_ALPHA_RANGE[1]:
+            # Use NFKC for this character only
+            result.append(unicodedata.normalize('NFKC', char))
+        else:
+            result.append(char)
+    return ''.join(result)
+
+
+def normalize_unicode_for_entity_matching(text: str) -> str:
+    """Normalize Unicode text for consistent entity resolution.
+
+    Applies security hardening to prevent adversarial Unicode attacks:
+    1. NFC normalization (compose combining characters)
+    2. Strip zero-width and invisible characters
+    3. Strip bidirectional override characters
+    4. Remove variation selectors (emoji modifiers)
+    5. Normalize mathematical alphanumerics to ASCII
+
+    This ensures "Microsoft" and "Micro​soft" (with ZWSP) are treated
+    identically, "Café" (NFC) matches "Café" (NFD decomposed), and
+    "𝐀𝐩𝐩𝐥𝐞" (math bold) matches "Apple".
+
+    Args:
+        text: Raw text string
+
+    Returns:
+        Normalized text safe for entity matching
+    """
+    if not text:
+        return text
+
+    # Step 1: NFC normalization - compose accented characters
+    # "Café" (NFD: e + combining acute) → "Café" (NFC: precomposed é)
+    text = unicodedata.normalize('NFC', text)
+
+    # Step 2: Strip zero-width and bidirectional control characters
+    text = ''.join(c for c in text if c not in UNICODE_SECURITY_STRIP)
+
+    # Step 3: Remove variation selectors and tag characters
+    # - Variation Selectors (U+FE00-U+FE0F): emoji variants
+    # - Variation Selectors Supplement (U+E0100-U+E01EF): extended variants
+    # - Tag Characters (U+E0001-U+E007F): deprecated language tags, can be exploited
+    text = ''.join(
+        c for c in text
+        if not (
+            0xFE00 <= ord(c) <= 0xFE0F or      # Variation Selectors
+            0xE0100 <= ord(c) <= 0xE01EF or    # Variation Selectors Supplement
+            0xE0001 <= ord(c) <= 0xE007F       # Tag Characters
+        )
+    )
+
+    # Step 4: Normalize mathematical alphanumerics (𝐀𝐩𝐩𝐥𝐞 → Apple)
+    text = _normalize_math_alphanumerics(text)
+
+    return text
+
+
 def sanitize_and_normalize_extracted_text(input_text: str, remove_inner_quotes=False) -> str:
     """Santitize and normalize extracted text
     Args:
@@ -2056,6 +2212,10 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     Returns:
         Normalized entity name
     """
+    # Security hardening: Apply Unicode normalization first
+    # This prevents zero-width character injection and NFC/NFD mismatches
+    name = normalize_unicode_for_entity_matching(name)
+
     # Clean HTML tags - remove paragraph and line break tags
     name = re.sub(r'</p\s*>|<p\s*>|<p/>', '', name, flags=re.IGNORECASE)
     name = re.sub(r'</br\s*>|<br\s*>|<br/>', '', name, flags=re.IGNORECASE)
@@ -2879,8 +3039,8 @@ def get_pinyin_sort_key(text: str) -> str:
             # Convert Chinese characters to pinyin, keep non-Chinese as-is
             pinyin_list = pypinyin.lazy_pinyin(text, style=pypinyin.Style.NORMAL)
             return ''.join(pinyin_list).lower()
-        except Exception:
-            # Silently fall back to simple string sorting on any error
+        except (AssertionError, AttributeError, TypeError, ValueError):
+            # Silently fall back to simple string sorting on any pypinyin error
             return text.lower()
     else:
         # pypinyin not available, use simple string sorting

@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal, cast, overload
 
 import json_repair
 from dotenv import load_dotenv
@@ -36,10 +36,7 @@ from lightrag.constants import (
     SOURCE_IDS_LIMIT_METHOD_FIFO,
     SOURCE_IDS_LIMIT_METHOD_KEEP,
 )
-from lightrag.exceptions import (
-    PipelineCancelledException,
-)
-from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.kg.shared_storage import check_pipeline_cancellation, get_storage_keyed_lock, update_pipeline_status
 from lightrag.prompt import PROMPTS
 from lightrag.utils import (
     CacheData,
@@ -630,10 +627,7 @@ async def rebuild_knowledge_from_chunks(
         f'Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing)'
     )
     logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = status_message
-            pipeline_status['history_messages'].append(status_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
     # Get cached extraction results for these chunks using storage
     # cached_results： chunk_id -> [list of (extraction_result, create_time) from LLM cache sorted by create_time of the first extraction_result]
@@ -646,10 +640,7 @@ async def rebuild_knowledge_from_chunks(
     if not cached_results:
         status_message = 'No cached extraction results found, cannot rebuild'
         logger.warning(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status['latest_message'] = status_message
-                pipeline_status['history_messages'].append(status_message)
+        await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
         return
 
     # Process cached results to get entities and relationships for each chunk
@@ -711,10 +702,7 @@ async def rebuild_knowledge_from_chunks(
         except Exception as e:
             status_message = f'Failed to parse cached extraction result for chunk {chunk_id}: {e}'
             logger.info(status_message)  # Per requirement, change to info
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status['latest_message'] = status_message
-                    pipeline_status['history_messages'].append(status_message)
+            await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
             continue
 
     # Get max async tasks limit from global_config for semaphore control
@@ -749,10 +737,7 @@ async def rebuild_knowledge_from_chunks(
                     failed_entities_count += 1
                     status_message = f'Failed to rebuild `{entity_name}`: {e}'
                     logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status['latest_message'] = status_message
-                            pipeline_status['history_messages'].append(status_message)
+                    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
     async def _locked_rebuild_relationship(src, tgt, chunk_ids):
         nonlocal rebuilt_relationships_count, failed_relationships_count
@@ -787,10 +772,7 @@ async def rebuild_knowledge_from_chunks(
                     failed_relationships_count += 1
                     status_message = f'Failed to rebuild `{src}`~`{tgt}`: {e}'
                     logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status['latest_message'] = status_message
-                            pipeline_status['history_messages'].append(status_message)
+                    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
     # Create tasks for parallel processing
     tasks = []
@@ -808,10 +790,7 @@ async def rebuild_knowledge_from_chunks(
     # Log parallel processing start
     status_message = f'Starting parallel rebuild of {len(entities_to_rebuild)} entities and {len(relationships_to_rebuild)} relationships (async: {graph_max_async})'
     logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = status_message
-            pipeline_status['history_messages'].append(status_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
     # Execute all tasks in parallel with semaphore control and early failure detection
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -851,10 +830,7 @@ async def rebuild_knowledge_from_chunks(
         status_message += f' Failed: {failed_entities_count} entities, {failed_relationships_count} relationships.'
 
     logger.info(status_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = status_message
-            pipeline_status['history_messages'].append(status_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
 
 async def _get_cached_extraction_results(
@@ -1309,10 +1285,7 @@ async def _rebuild_single_entity(
         status_message += f' ({truncation_info})'
     logger.info(status_message)
     # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = status_message
-            pipeline_status['history_messages'].append(status_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
 
 async def _rebuild_single_relationship(
@@ -1566,10 +1539,7 @@ async def _rebuild_single_relationship(
     logger.info(status_message)
 
     # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = status_message
-            pipeline_status['history_messages'].append(status_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
 
 async def _merge_nodes_then_upsert(
@@ -1692,10 +1662,7 @@ async def _merge_nodes_then_upsert(
         raise ValueError(f'Entity {entity_name} has no description')
 
     # Check for cancellation before LLM summary
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            if pipeline_status.get('cancellation_requested', False):
-                raise PipelineCancelledException('User cancelled during entity summary')
+    await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'entity summary')
 
     # 8. Get summary description an LLM usage status
     description, llm_was_used = await _handle_entity_relation_summary(
@@ -1777,10 +1744,7 @@ async def _merge_nodes_then_upsert(
     # Add message to pipeline satus when merge happens
     if already_fragment > 0 or llm_was_used:
         logger.info(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status['latest_message'] = status_message
-                pipeline_status['history_messages'].append(status_message)
+        await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
     else:
         logger.debug(status_message)
 
@@ -1976,10 +1940,7 @@ async def _merge_edges_then_upsert(
         raise ValueError(f'Relation {src_id}~{tgt_id} has no description')
 
     # Check for cancellation before LLM summary
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            if pipeline_status.get('cancellation_requested', False):
-                raise PipelineCancelledException('User cancelled during relation summary')
+    await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'relation summary')
 
     # 8. Get summary description an LLM usage status
     description, llm_was_used = await _handle_entity_relation_summary(
@@ -2067,10 +2028,7 @@ async def _merge_edges_then_upsert(
     # Add message to pipeline satus when merge happens
     if already_fragment > 0 or llm_was_used:
         logger.info(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status['latest_message'] = status_message
-                pipeline_status['history_messages'].append(status_message)
+        await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
     else:
         logger.debug(status_message)
 
@@ -2214,10 +2172,7 @@ async def _merge_edges_then_upsert(
             if updated:
                 status_message = f'Chunks appended from relation: `{need_insert_id}`'
                 logger.info(status_message)
-                if pipeline_status is not None and pipeline_status_lock is not None:
-                    async with pipeline_status_lock:
-                        pipeline_status['latest_message'] = status_message
-                        pipeline_status['history_messages'].append(status_message)
+                await update_pipeline_status(pipeline_status, pipeline_status_lock, status_message)
 
     edge_created_at = int(time.time())
     await knowledge_graph_inst.upsert_edge(
@@ -2293,6 +2248,11 @@ async def _resolve_entity_aliases_for_batch(
     in the VDB and the alias cache. If a match is found, the entity name
     is rewritten to the canonical form.
 
+    Uses LLM-based resolution:
+    1. Cache check first (instant, free)
+    2. VDB similarity search for candidates
+    3. LLM batch review for decisions
+
     Args:
         all_nodes: Dict mapping entity names to list of entity data
         all_edges: Dict mapping (src, tgt) tuples to list of edge data
@@ -2304,9 +2264,8 @@ async def _resolve_entity_aliases_for_batch(
     """
     from lightrag.entity_resolution import (
         EntityResolutionConfig,
-        find_abbreviation_match,
-        fuzzy_similarity,
         get_cached_alias,
+        llm_review_entities_batch,
         store_alias,
     )
 
@@ -2327,10 +2286,11 @@ async def _resolve_entity_aliases_for_batch(
     # Try to get database for alias cache
     db = None
     try:
-        if hasattr(entity_vdb, '_db_required'):
-            db = entity_vdb._db_required()  # type: ignore[union-attr]
-    except Exception:
-        pass  # Not PostgreSQL, skip alias cache
+        _db_required = getattr(entity_vdb, '_db_required', None)
+        if _db_required is not None:
+            db = _db_required()
+    except (RuntimeError, AttributeError):
+        pass  # Not PostgreSQL or not initialized - skip alias cache
 
     # Build alias map: original_name -> canonical_name
     alias_map: dict[str, str] = {}
@@ -2338,70 +2298,82 @@ async def _resolve_entity_aliases_for_batch(
 
     logger.debug(f'[{workspace}] Resolving aliases for {len(entity_names)} entities')
 
-    # Step 1: Check alias cache for known mappings
+    # Step 1: Check alias cache for known mappings (always done first)
     if db is not None:
         for entity_name in entity_names:
             try:
                 cached = await get_cached_alias(entity_name, db, workspace)
                 if cached:
-                    canonical, _method, confidence = cached
+                    canonical, _method, _confidence = cached
                     alias_map[entity_name] = canonical
                     logger.debug(f'[{workspace}] Cached alias: {entity_name} → {canonical}')
             except Exception as e:
                 logger.debug(f'[{workspace}] Alias cache lookup failed for {entity_name}: {e}')
 
-    # Step 2: Within-batch fuzzy resolution for remaining entities
-    # This catches typos within the same document batch
+    # Get remaining entities not resolved from cache
     remaining = [n for n in entity_names if n not in alias_map]
-    if entity_resolution_config.fuzzy_pre_resolution_enabled:
-        for i, name_a in enumerate(remaining):
-            if name_a in alias_map:
-                continue
-            for name_b in remaining[i + 1 :]:
-                if name_b in alias_map:
-                    continue
-                similarity = fuzzy_similarity(name_a, name_b)
-                if similarity >= entity_resolution_config.fuzzy_threshold:
-                    # Use longer name as canonical (more descriptive)
-                    if len(name_a) >= len(name_b):
-                        canonical, alias = name_a, name_b
-                    else:
-                        canonical, alias = name_b, name_a
-                    alias_map[alias] = canonical
-                    logger.debug(f'[{workspace}] Fuzzy match: {alias} → {canonical} ({similarity:.2f})')
 
-    # Step 3: Within-batch abbreviation detection
-    remaining = [n for n in entity_names if n not in alias_map]
-    if entity_resolution_config.abbreviation_detection_enabled:
-        for name in remaining:
-            if name in alias_map:
-                continue
-            # Check against other entities in batch
-            candidates = [n for n in remaining if n != name and n not in alias_map]
-            match = find_abbreviation_match(
-                name,
-                candidates,
-                min_confidence=entity_resolution_config.abbreviation_min_confidence,
-            )
-            if match:
-                canonical, confidence = match
-                alias_map[name] = canonical
-                logger.debug(f'[{workspace}] Abbreviation match: {name} → {canonical} ({confidence:.2f})')
+    # Step 2: LLM-based resolution for remaining entities
+    if remaining:
+        llm_model_func = global_config.get('llm_model_func')
+        if llm_model_func is None:
+            logger.debug(f'[{workspace}] No LLM function available for entity resolution')
+        else:
+            logger.debug(f'[{workspace}] Using LLM-based resolution for {len(remaining)} entities')
 
-    # Step 4: Store new aliases in cache
-    if db is not None and alias_map:
-        for alias, canonical in alias_map.items():
-            try:
-                await store_alias(
-                    alias=alias,
-                    canonical=canonical,
-                    method='extraction',
-                    confidence=0.9,  # High confidence for extraction-time resolution
-                    db=db,
-                    workspace=workspace,
-                )
-            except Exception as e:
-                logger.debug(f'[{workspace}] Failed to store alias {alias} → {canonical}: {e}')
+            # Helper to call LLM with proper signature
+            async def llm_fn(user_prompt: str, system_prompt: str | None = None) -> str:
+                if system_prompt:
+                    return await llm_model_func(user_prompt, system_prompt=system_prompt)
+                return await llm_model_func(user_prompt)
+
+            # Extract entity types from all_nodes for LLM context
+            entity_types_map: dict[str, str] = {}
+            for entity_name, entities_list in all_nodes.items():
+                if entities_list and isinstance(entities_list, list) and len(entities_list) > 0:
+                    # Get the most common entity type from the list
+                    first_entity = entities_list[0]
+                    if isinstance(first_entity, dict):
+                        entity_types_map[entity_name] = first_entity.get('entity_type', 'Unknown')
+
+            # Process in batches
+            for i in range(0, len(remaining), entity_resolution_config.batch_size):
+                batch = remaining[i : i + entity_resolution_config.batch_size]
+
+                try:
+                    batch_result = await llm_review_entities_batch(
+                        new_entities=batch,
+                        entity_vdb=entity_vdb,
+                        llm_fn=llm_fn,
+                        config=entity_resolution_config,
+                        entity_types=entity_types_map,
+                    )
+
+                    for r in batch_result.results:
+                        if r.matches_existing and r.confidence >= entity_resolution_config.min_confidence:
+                            alias_map[r.new_entity] = r.canonical
+                            logger.debug(
+                                f'[{workspace}] LLM match: {r.new_entity} → {r.canonical} ({r.confidence:.2f})'
+                            )
+
+                            # Store in alias cache
+                            if db is not None and entity_resolution_config.auto_apply:
+                                try:
+                                    await store_alias(
+                                        alias=r.new_entity,
+                                        canonical=r.canonical,
+                                        method='llm',
+                                        confidence=r.confidence,
+                                        db=db,
+                                        workspace=workspace,
+                                        llm_reasoning=r.reasoning,
+                                        entity_type=r.entity_type,
+                                    )
+                                except Exception as e:
+                                    logger.debug(f'[{workspace}] Failed to store LLM alias: {e}')
+
+                except Exception as e:
+                    logger.warning(f'[{workspace}] LLM batch review failed: {e}')
 
     # If no aliases found, return original data
     if not alias_map:
@@ -2478,10 +2450,7 @@ async def merge_nodes_and_edges(
     """
 
     # Check for cancellation at the start of merge
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            if pipeline_status.get('cancellation_requested', False):
-                raise PipelineCancelledException('User cancelled during merge phase')
+    await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'merge phase')
 
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
@@ -2514,10 +2483,7 @@ async def merge_nodes_and_edges(
 
     log_message = f'Merging stage {current_file_number}/{total_files}: {file_path}'
     logger.info(log_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = log_message
-            pipeline_status['history_messages'].append(log_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, log_message)
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = int(global_config.get('llm_model_max_async', 4)) * 2
@@ -2526,18 +2492,12 @@ async def merge_nodes_and_edges(
     # ===== Phase 1: Process all entities concurrently =====
     log_message = f'Phase 1: Processing {total_entities_count} entities from {doc_id} (async: {graph_max_async})'
     logger.info(log_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = log_message
-            pipeline_status['history_messages'].append(log_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, log_message)
 
     async def _locked_process_entity_name(entity_name, entities):
         async with semaphore:
             # Check for cancellation before processing entity
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    if pipeline_status.get('cancellation_requested', False):
-                        raise PipelineCancelledException('User cancelled during entity merge')
+            await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'entity merge')
 
             workspace = global_config.get('workspace', '')
             namespace = f'{workspace}:GraphDB' if workspace else 'GraphDB'
@@ -2564,10 +2524,7 @@ async def merge_nodes_and_edges(
 
                     # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
-                        if pipeline_status is not None and pipeline_status_lock is not None:
-                            async with pipeline_status_lock:
-                                pipeline_status['latest_message'] = error_msg
-                                pipeline_status['history_messages'].append(error_msg)
+                        await update_pipeline_status(pipeline_status, pipeline_status_lock, error_msg)
                     except Exception as status_error:
                         logger.error(f'Failed to update pipeline status: {status_error}')
 
@@ -2615,18 +2572,12 @@ async def merge_nodes_and_edges(
     # ===== Phase 2: Process all relationships concurrently =====
     log_message = f'Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})'
     logger.info(log_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = log_message
-            pipeline_status['history_messages'].append(log_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, log_message)
 
     async def _locked_process_edges(edge_key, edges):
         async with semaphore:
             # Check for cancellation before processing edges
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    if pipeline_status.get('cancellation_requested', False):
-                        raise PipelineCancelledException('User cancelled during relation merge')
+            await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'relation merge')
 
             workspace = global_config.get('workspace', '')
             namespace = f'{workspace}:GraphDB' if workspace else 'GraphDB'
@@ -2668,10 +2619,7 @@ async def merge_nodes_and_edges(
 
                     # Try to update pipeline status, but don't let status update failure affect main exception
                     try:
-                        if pipeline_status is not None and pipeline_status_lock is not None:
-                            async with pipeline_status_lock:
-                                pipeline_status['latest_message'] = error_msg
-                                pipeline_status['history_messages'].append(error_msg)
+                        await update_pipeline_status(pipeline_status, pipeline_status_lock, error_msg)
                     except Exception as status_error:
                         logger.error(f'Failed to update pipeline status: {status_error}')
 
@@ -2750,10 +2698,7 @@ async def merge_nodes_and_edges(
 
             log_message = f'Phase 3: Updating final {len(final_entity_names)}({len(processed_entities)}+{len(all_added_entities)}) entities and  {len(final_relation_pairs)} relations from {doc_id}'
             logger.info(log_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status['latest_message'] = log_message
-                    pipeline_status['history_messages'].append(log_message)
+            await update_pipeline_status(pipeline_status, pipeline_status_lock, log_message)
 
             # Update storage
             if final_entity_names:
@@ -2786,10 +2731,7 @@ async def merge_nodes_and_edges(
 
     log_message = f'Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations'
     logger.info(log_message)
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status['latest_message'] = log_message
-            pipeline_status['history_messages'].append(log_message)
+    await update_pipeline_status(pipeline_status, pipeline_status_lock, log_message)
 
 
 async def extract_entities(
@@ -2801,10 +2743,7 @@ async def extract_entities(
     text_chunks_storage: BaseKVStorage | None = None,
 ) -> list:
     # Check for cancellation at the start of entity extraction
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            if pipeline_status.get('cancellation_requested', False):
-                raise PipelineCancelledException('User cancelled during entity extraction')
+    await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'entity extraction')
 
     use_llm_func: Callable[..., Any] = global_config['llm_model_func']
     entity_extract_max_gleaning = int(global_config.get('entity_extract_max_gleaning', 0))
@@ -2951,10 +2890,7 @@ async def extract_entities(
         relations_count = len(maybe_edges)
         log_message = f'Chunk {processed_chunks} of {total_chunks} extracted {entities_count} Ent + {relations_count} Rel {chunk_key}'
         logger.info(log_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status['latest_message'] = log_message
-                pipeline_status['history_messages'].append(log_message)
+        await update_pipeline_status(pipeline_status, pipeline_status_lock, log_message)
 
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
@@ -2966,10 +2902,7 @@ async def extract_entities(
     async def _process_with_semaphore(chunk):
         async with semaphore:
             # Check for cancellation before processing chunk
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    if pipeline_status.get('cancellation_requested', False):
-                        raise PipelineCancelledException('User cancelled during chunk processing')
+            await check_pipeline_cancellation(pipeline_status, pipeline_status_lock, 'chunk processing')
 
             try:
                 return await _process_single_content(chunk)
@@ -3166,12 +3099,15 @@ async def kg_query(
         logger.info(' == LLM cache == Query cache hit, using cached response as query result')
         response = cached_response
     else:
-        response = await use_model_func(  # type: ignore[misc]
-            user_query,
-            system_prompt=sys_prompt,
-            history_messages=query_param.conversation_history,
-            enable_cot=True,
-            stream=query_param.stream,
+        response = cast(
+            str,
+            await use_model_func(
+                user_query,
+                system_prompt=sys_prompt,
+                history_messages=query_param.conversation_history,
+                enable_cot=True,
+                stream=query_param.stream,
+            ),
         )
 
         if hashing_kv and hashing_kv.global_config.get('enable_llm_cache'):
@@ -3306,7 +3242,7 @@ async def extract_keywords_only(
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    result = await use_model_func(kw_prompt, keyword_extraction=True)  # type: ignore[misc]
+    result = cast(str, await use_model_func(kw_prompt, keyword_extraction=True))
 
     # 5. Parse out JSON from the LLM response
     result = remove_think_tags(result)
@@ -3384,16 +3320,21 @@ async def _get_vector_context(
         cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
         # Use BM25 fusion (vector + BM25 with RRF) if enabled and available
-        if query_param.enable_bm25_fusion and hasattr(chunks_vdb, 'hybrid_search'):
-            logger.info(f'Using BM25 fusion (bm25_weight={query_param.bm25_weight})')
-            results = await chunks_vdb.hybrid_search(  # type: ignore[union-attr]
-                query,
-                top_k=search_top_k,
-                query_embedding=query_embedding,
-                bm25_weight=query_param.bm25_weight,
-            )
-        else:
-            results = await chunks_vdb.query(query, top_k=search_top_k, query_embedding=query_embedding)
+        try:
+            hybrid_search = getattr(chunks_vdb, 'hybrid_search', None)
+            if query_param.enable_bm25_fusion and hybrid_search is not None:
+                logger.info(f'Using BM25 fusion (bm25_weight={query_param.bm25_weight})')
+                results = await hybrid_search(
+                    query,
+                    top_k=search_top_k,
+                    query_embedding=query_embedding,
+                    bm25_weight=query_param.bm25_weight,
+                )
+            else:
+                results = await chunks_vdb.query(query, top_k=search_top_k, query_embedding=query_embedding)
+        except Exception as e:
+            logger.error(f'Chunk vector search failed for query "{query[:50]}...": {e}')
+            return []
 
         if not results:
             logger.info(f'Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})')
@@ -3463,7 +3404,7 @@ async def _perform_kg_search(
             use_model_func = query_param.model_func or text_chunks_db.global_config.get('llm_model_func')
             if use_model_func:
                 hyde_prompt = PROMPTS['hyde_prompt'].format(query=query)
-                hypothetical_answer = await use_model_func(hyde_prompt)  # type: ignore[misc]
+                hypothetical_answer = cast(str, await use_model_func(hyde_prompt))
                 if hypothetical_answer and isinstance(hypothetical_answer, str) and len(hypothetical_answer) > 20:
                     embedding_query_text = hypothetical_answer
                     logger.debug(
@@ -4200,7 +4141,11 @@ async def _get_node_data(
     # get similar entities
     logger.info(f'Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})')
 
-    results = await entities_vdb.query(query, top_k=query_param.top_k)
+    try:
+        results = await entities_vdb.query(query, top_k=query_param.top_k)
+    except Exception as e:
+        logger.error(f'Entity vector search failed for query "{query[:50]}...": {e}')
+        return [], []
 
     if not len(results):
         return [], []
@@ -4458,7 +4403,11 @@ async def _get_edge_data(
         f'Query edges: {keywords} (top_k:{query_param.top_k}, cosine:{relationships_vdb.cosine_better_than_threshold})'
     )
 
-    results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
+    try:
+        results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
+    except Exception as e:
+        logger.error(f'Relationship vector search failed for keywords "{str(keywords)[:50]}...": {e}')
+        return [], []
 
     if not len(results):
         return [], []
@@ -4789,7 +4738,7 @@ async def naive_query(
     if query_param.enable_hyde:
         try:
             hyde_prompt = PROMPTS['hyde_prompt'].format(query=query)
-            hypothetical_answer = await use_model_func(hyde_prompt)  # type: ignore[misc]
+            hypothetical_answer = cast(str, await use_model_func(hyde_prompt))
             if hypothetical_answer and isinstance(hypothetical_answer, str) and len(hypothetical_answer) > 20:
                 embedding_func = getattr(chunks_vdb, 'embedding_func', None)
                 if embedding_func:
@@ -4934,12 +4883,15 @@ async def naive_query(
         logger.info(' == LLM cache == Query cache hit, using cached response as query result')
         response = cached_response
     else:
-        response = await use_model_func(  # type: ignore[misc]
-            user_query,
-            system_prompt=sys_prompt,
-            history_messages=query_param.conversation_history,
-            enable_cot=True,
-            stream=query_param.stream,
+        response = cast(
+            str,
+            await use_model_func(
+                user_query,
+                system_prompt=sys_prompt,
+                history_messages=query_param.conversation_history,
+                enable_cot=True,
+                stream=query_param.stream,
+            ),
         )
 
         if hashing_kv and hashing_kv.global_config.get('enable_llm_cache'):

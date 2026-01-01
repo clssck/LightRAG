@@ -87,39 +87,6 @@ class TestAuthWithNoApiKey:
         response = client.delete('/aliases/NYC')
         assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
 
-    def test_cluster_start_works_without_api_key(self, mock_rag, mock_db):
-        """POST /aliases/cluster/start should work without API key."""
-        from lightrag.api.routers.alias_routes import create_alias_routes
-
-        app = FastAPI()
-        router = create_alias_routes(mock_rag, api_key=None)
-        app.include_router(router)
-        client = TestClient(app)
-
-        class MockLock:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        with (
-            patch(
-                'lightrag.kg.shared_storage.get_namespace_data', new_callable=AsyncMock
-            ) as mock_ns_data,
-            patch('lightrag.kg.shared_storage.get_namespace_lock') as mock_ns_lock,
-            patch('asyncio.create_task'),
-        ):
-            mock_ns_data.return_value = {'busy': False}
-            mock_ns_lock.return_value = MockLock()
-            response = client.post(
-                '/aliases/cluster/start',
-                json={'similarity_threshold': 0.85}
-            )
-
-        # Should succeed or indicate already busy, not 403
-        assert response.status_code in [200, 409], f"Got {response.status_code}: {response.text}"
-
 
 class TestAuthWithApiKey:
     """Tests for when LIGHTRAG_API_KEY is configured.

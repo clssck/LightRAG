@@ -8,6 +8,7 @@ import re
 import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timezone
 from typing import Any, ClassVar, Literal, TypeVar, cast, final, overload
@@ -35,6 +36,12 @@ from lightrag.kg.shared_storage import get_data_init_lock
 from lightrag.namespace import NameSpace, is_namespace
 from lightrag.types import KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode
 from lightrag.utils import logger
+from lightrag.validators import (
+    PG_MAX_IDENTIFIER_LENGTH,
+    validate_numeric_config,
+    validate_sql_identifier,
+    validate_workspace_name,
+)
 
 if not pm.is_installed('asyncpg'):
     pm.install('asyncpg')
@@ -53,9 +60,6 @@ from pgvector.asyncpg import register_vector  # type: ignore
 load_dotenv(dotenv_path='.env', override=False)
 
 T = TypeVar('T')
-
-# PostgreSQL identifier length limit (in bytes)
-PG_MAX_IDENTIFIER_LENGTH = 63
 
 # Maximum UNWIND batch size for AGE Cypher queries
 # Larger batches may cause memory issues or timeouts in AGE
@@ -230,7 +234,8 @@ class PostgreSQLDB:
         self.user = config['user']
         self.password = config['password']
         self.database = config['database']
-        self.workspace = config['workspace']
+        # Validate workspace name to prevent graph name collisions
+        self.workspace = validate_workspace_name(config['workspace'])
         self.max = int(config['max_connections'])
         self.min = int(config.get('min_connections', 5))
         if self.min > self.max:
@@ -617,9 +622,10 @@ class PostgreSQLDB:
             if elapsed > slow_threshold:
                 logger.warning(f'[{self.workspace}] Slow operation: {operation_name} took {elapsed:.2f}s')
             return result
-        except Exception:
+        except Exception as e:
+            # Re-raise after logging timing - intentionally broad to capture all failure modes
             elapsed = time.perf_counter() - start
-            logger.error(f'[{self.workspace}] Failed operation: {operation_name} after {elapsed:.2f}s')
+            logger.error(f'[{self.workspace}] Failed operation: {operation_name} after {elapsed:.2f}s: {e}')
             raise
 
     @staticmethod
@@ -676,13 +682,22 @@ class PostgreSQLDB:
         - Attempts to create a new graph with the provided `graph_name` if it does not already exist.
         - Silently ignores errors related to the graph already existing.
 
+        Note:
+            graph_name is validated to prevent SQL injection. The validation chain is:
+            1. workspace validated by validate_workspace_name() in __init__
+            2. graph_name derived from workspace via _get_workspace_graph_name()
+            3. This validate_sql_identifier() call provides defense-in-depth
         """
+        # Defense-in-depth: validate graph_name even though it should come from validated workspace
+        validate_sql_identifier(graph_name, 'graph_name')
+
         try:
             await connection.execute(  # type: ignore
                 'SET search_path = ag_catalog, "$user", public'
             )
+            # AGE's create_graph() expects a text literal; identifier is validated above
             await connection.execute(  # type: ignore
-                f"select create_graph('{graph_name}')"
+                f"SELECT create_graph('{graph_name}')"
             )
         except (
             asyncpg.exceptions.InvalidSchemaNameError,
@@ -700,16 +715,21 @@ class PostgreSQLDB:
         Note:
             This method does not catch exceptions. Configuration errors will fail-fast,
             while transient connection errors will be retried by _run_with_retry.
+            Numeric parameters are validated before interpolation to prevent SQL injection.
         """
         # Handle probes parameter - only set if non-empty value is provided
         if self.vchordrq_probes and str(self.vchordrq_probes).strip():
-            await connection.execute(f"SET vchordrq.probes TO '{self.vchordrq_probes}'")
-            logger.debug(f'PostgreSQL, VCHORDRQ probes set to: {self.vchordrq_probes}')
+            # Validate probes is numeric before interpolation (SET doesn't support $1 params)
+            probes_val = int(validate_numeric_config(self.vchordrq_probes, 'vchordrq_probes', min_val=1))
+            await connection.execute(f'SET vchordrq.probes TO {probes_val}')
+            logger.debug(f'PostgreSQL, VCHORDRQ probes set to: {probes_val}')
 
         # Handle epsilon parameter independently - check for None to allow 0.0 as valid value
         if self.vchordrq_epsilon is not None:
-            await connection.execute(f'SET vchordrq.epsilon TO {self.vchordrq_epsilon}')
-            logger.debug(f'PostgreSQL, VCHORDRQ epsilon set to: {self.vchordrq_epsilon}')
+            # Validate epsilon is numeric before interpolation
+            epsilon_val = validate_numeric_config(self.vchordrq_epsilon, 'vchordrq_epsilon', min_val=0.0)
+            await connection.execute(f'SET vchordrq.epsilon TO {epsilon_val}')
+            logger.debug(f'PostgreSQL, VCHORDRQ epsilon set to: {epsilon_val}')
 
     async def configure_hnsw(self, connection: Connection | PoolConnectionProxy) -> None:
         """Configure HNSW search parameters for this connection.
@@ -721,9 +741,12 @@ class PostgreSQLDB:
         Note:
             This method does not catch exceptions. Configuration errors will fail-fast,
             while transient connection errors will be retried by _run_with_retry.
+            Numeric parameters are validated before interpolation to prevent SQL injection.
         """
         if self.hnsw_ef_search is not None:
-            await connection.execute(f'SET hnsw.ef_search = {int(self.hnsw_ef_search)}')
+            # Validate ef_search is numeric before interpolation (SET doesn't support $1 params)
+            ef_search_val = int(validate_numeric_config(self.hnsw_ef_search, 'hnsw_ef_search', min_val=1))
+            await connection.execute(f'SET hnsw.ef_search = {ef_search_val}')
             # ef_search controls recall vs speed tradeoff: higher = better recall, slower queries
             # Default 200 is moderate; for accuracy-critical apps, set POSTGRES_HNSW_EF_SEARCH=400+
             logger.debug(
@@ -760,6 +783,193 @@ class PostgreSQLDB:
             'success': len(self._migration_failures) == 0,
             'failures': self._migration_failures.copy(),
         }
+
+    # ========================================================================
+    # Schema Migration Tracking (Production Hardening)
+    # ========================================================================
+
+    # Advisory lock ID for schema migrations (deterministic 31-bit integer)
+    # Using a fixed hash ensures all processes use the same lock
+    _SCHEMA_MIGRATION_LOCK_ID: ClassVar[int] = hash('lightrag_schema_migration') & 0x7FFFFFFF
+
+    @asynccontextmanager
+    async def _advisory_lock(self, lock_name: str = 'schema_migration'):
+        """Acquire PostgreSQL advisory lock for coordinating schema operations.
+
+        Advisory locks are session-level locks that coordinate between processes
+        without blocking table access. This prevents race conditions when multiple
+        LightRAG instances start simultaneously and try to run migrations.
+
+        Args:
+            lock_name: Name for the lock (used to generate lock ID)
+
+        Yields:
+            None - lock is held for the duration of the context
+
+        Example:
+            async with self._advisory_lock('schema_migration'):
+                await self.execute('ALTER TABLE ...')
+        """
+        # Generate deterministic lock ID from name
+        lock_id = hash(lock_name) & 0x7FFFFFFF  # 31-bit positive integer
+
+        await self._ensure_pool()
+        assert self.pool is not None
+
+        async with self.pool.acquire() as conn:
+            try:
+                # Acquire exclusive advisory lock (blocks until available)
+                await conn.execute(f'SELECT pg_advisory_lock({lock_id})')
+                logger.debug(f'PostgreSQL, Acquired advisory lock: {lock_name} (id={lock_id})')
+                yield
+            finally:
+                # Release the lock
+                await conn.execute(f'SELECT pg_advisory_unlock({lock_id})')
+                logger.debug(f'PostgreSQL, Released advisory lock: {lock_name} (id={lock_id})')
+
+    async def _ensure_schema_migrations_table(self) -> None:
+        """Bootstrap the schema migrations table (must exist before tracking).
+
+        This is called BEFORE advisory locking because the table must exist
+        for the locking mechanism to work properly. Uses IF NOT EXISTS
+        to be idempotent across concurrent processes.
+        """
+        create_sql = """
+        CREATE TABLE IF NOT EXISTS LIGHTRAG_SCHEMA_MIGRATIONS (
+            version INTEGER PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            checksum VARCHAR(64) NULL
+        )
+        """
+        try:
+            await self.execute(create_sql)
+            logger.debug('PostgreSQL, Schema migrations table ready')
+        except Exception as e:
+            logger.error(f'PostgreSQL, Failed to create schema migrations table: {e}')
+            raise
+
+    async def _is_migration_applied(self, version: int) -> bool:
+        """Check if a specific migration version has been applied.
+
+        Args:
+            version: Migration version number
+
+        Returns:
+            True if migration was already applied, False otherwise
+        """
+        result = await self.query(
+            'SELECT version FROM LIGHTRAG_SCHEMA_MIGRATIONS WHERE version = $1',
+            [version],
+        )
+        return result is not None
+
+    async def _record_migration(self, version: int, name: str, checksum: str | None = None) -> None:
+        """Record a successfully applied migration.
+
+        Args:
+            version: Migration version number
+            name: Human-readable migration name
+            checksum: Optional SHA256 hash of migration SQL for verification
+        """
+        await self.execute(
+            """INSERT INTO LIGHTRAG_SCHEMA_MIGRATIONS (version, name, checksum)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (version) DO NOTHING""",
+            data={'version': version, 'name': name, 'checksum': checksum},
+        )
+        logger.info(f'PostgreSQL, Recorded migration v{version}: {name}')
+
+    async def get_applied_migrations(self) -> list[dict[str, Any]]:
+        """Get list of all applied migrations.
+
+        Returns:
+            List of dicts with version, name, applied_at, checksum
+        """
+        result = await self.query(
+            """SELECT version, name,
+                      EXTRACT(EPOCH FROM applied_at)::BIGINT as applied_at,
+                      checksum
+               FROM LIGHTRAG_SCHEMA_MIGRATIONS
+               ORDER BY version""",
+            multirows=True,
+        )
+        return result or []
+
+    # ========================================================================
+    # Vector Dimension Validation (Production Hardening)
+    # ========================================================================
+
+    async def validate_vector_dimensions(self) -> None:
+        """Validate that existing vector columns match EMBEDDING_DIM configuration.
+
+        pgvector stores fixed-dimension vectors. If EMBEDDING_DIM changes (e.g.,
+        switching embedding models), existing data becomes incompatible. This
+        validation fails fast on startup rather than causing silent data corruption.
+
+        Raises:
+            ValueError: If database vector dimension doesn't match EMBEDDING_DIM
+
+        Note:
+            Only validates if vector tables already exist with data. New databases
+            are fine because tables will be created with the correct dimension.
+        """
+        expected_dim = int(os.environ.get('EMBEDDING_DIM', 1024))
+
+        # Vector tables to check
+        vector_tables = [
+            ('lightrag_vdb_chunks', 'content_vector'),
+            ('lightrag_vdb_entity', 'content_vector'),
+            ('lightrag_vdb_relation', 'content_vector'),
+        ]
+
+        for table_name, column_name in vector_tables:
+            try:
+                # Check if table exists first
+                table_exists = await self.query(
+                    """SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = $1
+                    ) as exists""",
+                    [table_name],
+                )
+
+                if not table_exists or not table_exists.get('exists'):
+                    continue  # Table doesn't exist yet, will be created with correct dim
+
+                # Get the vector column dimension from pg_attribute
+                # atttypmod for vector type = dimension + 4 (pgvector internal offset)
+                dim_result = await self.query(
+                    """SELECT atttypmod - 4 as dimension
+                       FROM pg_attribute
+                       WHERE attrelid = $1::regclass
+                       AND attname = $2
+                       AND atttypmod > 0""",
+                    [table_name, column_name],
+                )
+
+                if dim_result and dim_result.get('dimension'):
+                    actual_dim = dim_result['dimension']
+                    if actual_dim != expected_dim:
+                        raise ValueError(
+                            f"VECTOR DIMENSION MISMATCH: Table '{table_name}' has {actual_dim}D vectors, "
+                            f"but EMBEDDING_DIM={expected_dim}. "
+                            f"Options: (1) Set EMBEDDING_DIM={actual_dim} to match existing data, or "
+                            f"(2) Run a manual migration to alter column dimensions and rebuild indexes. "
+                            f"See docs/vector_migration.md for migration steps."
+                        )
+                    logger.debug(
+                        f'PostgreSQL, Vector dimension validated: {table_name}.{column_name} = {actual_dim}D'
+                    )
+
+            except ValueError:
+                # Re-raise dimension mismatch errors
+                raise
+            except Exception as e:
+                # Log but don't fail on inspection errors (table might not exist yet)
+                logger.debug(f'PostgreSQL, Could not validate {table_name} dimensions: {e}')
+
+        logger.info(f'PostgreSQL, Vector dimensions validated: EMBEDDING_DIM={expected_dim}')
 
     async def _migrate_llm_cache_schema(self):
         """Migrate LLM cache schema: add new columns and remove deprecated mode field"""
@@ -1285,6 +1495,63 @@ class PostgreSQLDB:
         except Exception as e:
             logger.warning(f'Failed to add metadata/error_msg columns to LIGHTRAG_DOC_STATUS: {e}')
 
+    async def _migrate_entity_aliases_add_llm_columns(self):
+        """Add LLM-related columns to LIGHTRAG_ENTITY_ALIASES table for LLM-based entity resolution.
+
+        New columns:
+        - llm_reasoning: TEXT - LLM's explanation for the alias decision (audit trail)
+        - source_doc_id: VARCHAR(255) - Which document triggered this alias discovery
+        - verified: BOOLEAN - Whether a human has reviewed/verified this alias
+        - entity_type: VARCHAR(100) - Type of entities (for filtering)
+        """
+        columns_to_add = [
+            {
+                'name': 'llm_reasoning',
+                'type': 'TEXT NULL',
+                'description': 'LLM reasoning for alias decision',
+            },
+            {
+                'name': 'source_doc_id',
+                'type': 'VARCHAR(255) NULL',
+                'description': 'Document that triggered discovery',
+            },
+            {
+                'name': 'verified',
+                'type': 'BOOLEAN DEFAULT FALSE',
+                'description': 'Human verification status',
+            },
+            {
+                'name': 'entity_type',
+                'type': 'VARCHAR(100) NULL',
+                'description': 'Type of entities',
+            },
+        ]
+
+        for col in columns_to_add:
+            try:
+                # Check if column exists
+                check_sql = """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'lightrag_entity_aliases'
+                AND column_name = $1
+                """
+                col_exists = await self.query(check_sql, [col['name']])
+
+                if not col_exists:
+                    logger.info(f"Adding {col['name']} column to LIGHTRAG_ENTITY_ALIASES table")
+                    add_sql = f"""
+                    ALTER TABLE LIGHTRAG_ENTITY_ALIASES
+                    ADD COLUMN {col['name']} {col['type']}
+                    """
+                    await self.execute(add_sql)
+                    logger.info(f"Successfully added {col['name']} column to LIGHTRAG_ENTITY_ALIASES table")
+                else:
+                    logger.info(f"{col['name']} column already exists in LIGHTRAG_ENTITY_ALIASES table")
+
+            except Exception as e:
+                logger.warning(f"Failed to add {col['name']} column to LIGHTRAG_ENTITY_ALIASES: {e}")
+
     async def _migrate_field_lengths(self):
         """Migrate database field lengths: entity_name, source_id, target_id, and file_path"""
         # Define the field changes needed
@@ -1394,11 +1661,29 @@ class PostgreSQLDB:
             logger.error(f'Failed to batch check field lengths: {e}')
 
     async def check_tables(self):
+        # Bootstrap: Create schema migrations table FIRST (before acquiring advisory lock)
+        # This must happen before locking because the lock acquisition itself may need
+        # to query this table in future implementations
+        await self._ensure_schema_migrations_table()
+
+        # Acquire advisory lock to prevent race conditions during schema changes
+        # Multiple processes starting simultaneously will wait here
+        async with self._advisory_lock('schema_migration'):
+            await self._check_tables_locked()
+
+    async def _check_tables_locked(self):
+        """Internal method that runs table creation under advisory lock."""
+        # Tables to skip in the main loop (already created or special handling)
+        skip_tables = {'LIGHTRAG_SCHEMA_MIGRATIONS'}
+
         # First create all tables
         for k, v in TABLES.items():
+            if k in skip_tables:
+                continue
             try:
                 await self.query(f'SELECT 1 FROM {k} LIMIT 1')
-            except Exception:
+            except asyncpg.exceptions.UndefinedTableError:
+                # Table doesn't exist - create it
                 try:
                     logger.info(f'PostgreSQL, Try Creating table {k} in database')
                     await self.execute(v['ddl'])
@@ -1408,6 +1693,10 @@ class PostgreSQLDB:
                         f'PostgreSQL, Failed to create table {k} in database, Please verify the connection with PostgreSQL database, Got: {e}'
                     )
                     raise e
+
+        # Validate vector dimensions BEFORE creating vector indexes
+        # This fails fast if EMBEDDING_DIM doesn't match existing data
+        await self.validate_vector_dimensions()
 
         # Batch check all indexes at once (optimization: single query instead of N queries)
         existing_indexes: set[str] = set()
@@ -1429,7 +1718,8 @@ class PostgreSQLDB:
 
             # Create missing indexes
             # Tables that don't have an 'id' column (use different primary key structure)
-            tables_without_id = {'LIGHTRAG_ENTITY_ALIASES'}
+            # LIGHTRAG_SCHEMA_MIGRATIONS uses 'version' as PK, no workspace column
+            tables_without_id = {'LIGHTRAG_ENTITY_ALIASES', 'LIGHTRAG_SCHEMA_MIGRATIONS'}
 
             for k in table_names:
                 # Skip tables that don't have an 'id' column
@@ -1617,6 +1907,12 @@ class PostgreSQLDB:
             self._migrate_entity_aliases_schema(),
             'entity_aliases_schema',
             'Failed to migrate entity aliases schema',
+        )
+
+        await self._run_migration(
+            self._migrate_entity_aliases_add_llm_columns(),
+            'entity_aliases_llm_columns',
+            'Failed to add LLM columns to entity aliases table',
         )
 
         await self._run_migration(
@@ -2075,18 +2371,30 @@ class PostgreSQLDB:
         }
 
         embedding_dim = int(os.environ.get('EMBEDDING_DIM', 1024))
+        # Validate embedding_dim to prevent injection in DDL statements
+        embedding_dim = int(validate_numeric_config(embedding_dim, 'EMBEDDING_DIM', min_val=1, max_val=65535))
+
         vector_index_type = self.vector_index_type or 'HNSW'
         vit_lower = vector_index_type.lower()
         for k in vdb_tables:
+            # Defense-in-depth: validate table name even though it comes from hardcoded list
+            validate_sql_identifier(k, 'table_name')
+
             vector_index_name = f'idx_{k.lower()}_{vit_lower}_cosine'
-            check_vector_index_sql = f"""
+            validate_sql_identifier(vector_index_name, 'index_name')
+
+            # Use parameterized query for index existence check (prevents SQL injection)
+            check_vector_index_sql = """
                     SELECT 1 FROM pg_indexes
-                    WHERE indexname = '{vector_index_name}' AND tablename = '{k.lower()}'
+                    WHERE indexname = $1 AND tablename = $2
                 """
             try:
-                vector_index_exists = await self.query(check_vector_index_sql)
+                vector_index_exists = await self.query(
+                    check_vector_index_sql, [vector_index_name, k.lower()]
+                )
                 if not vector_index_exists:
                     # Only set vector dimension when index doesn't exist
+                    # DDL statements require identifier interpolation (validated above)
                     alter_sql = f'ALTER TABLE {k} ALTER COLUMN content_vector TYPE VECTOR({embedding_dim})'
                     await self.execute(alter_sql)
                     logger.debug(f'Ensured vector dimension for {k}')
@@ -3128,11 +3436,18 @@ class PGVectorStorage(BaseVectorStorage):
             for k, v in data.items()
         ]
 
-        # Batch compute embeddings (already optimized)
+        # Batch compute embeddings with bounded parallelism
         contents = [v['content'] for v in data.values()]
         batches = [contents[i : i + self._max_batch_size] for i in range(0, len(contents), self._max_batch_size)]
-        embedding_tasks = [self.embedding_func(batch) for batch in batches]
-        embeddings_list = await asyncio.gather(*embedding_tasks)
+
+        max_concurrent_embeddings = int(os.getenv('LIGHTRAG_MAX_CONCURRENT_EMBEDDINGS', '3'))
+        semaphore = asyncio.Semaphore(max_concurrent_embeddings)
+
+        async def bounded_embedding(batch: list[str]) -> np.ndarray:
+            async with semaphore:
+                return await self.embedding_func(batch)
+
+        embeddings_list = await asyncio.gather(*[bounded_embedding(batch) for batch in batches])
         embeddings = np.concatenate(embeddings_list)
 
         # Assign embeddings to items
@@ -3274,6 +3589,79 @@ class PGVectorStorage(BaseVectorStorage):
 
         return fused_results[:top_k]
 
+    async def hybrid_entity_search(
+        self,
+        query: str,
+        top_k: int,
+        trigram_weight: float = 0.4,
+        min_trigram_similarity: float = 0.25,
+    ) -> list[dict[str, Any]]:
+        """Combine VDB semantic search with pg_trgm character similarity for entities.
+
+        This hybrid approach catches both semantic and character-level matches:
+        - VDB search: Captures semantic similarity (good for synonyms, translations)
+        - pg_trgm: Captures character-level similarity (good for typos, abbreviations)
+
+        Uses Reciprocal Rank Fusion (RRF) to combine the ranked results.
+
+        Args:
+            query: Entity name to search for
+            top_k: Number of final results to return
+            trigram_weight: Weight for trigram results (0.0-1.0). Higher = more trigram influence.
+            min_trigram_similarity: Minimum trigram similarity threshold (0.0-1.0)
+
+        Returns:
+            List of entities with entity_name, created_at, and rrf_score
+        """
+        from lightrag.utils import reciprocal_rank_fusion
+
+        # Determine how many results to fetch from each source
+        vector_fetch_k = int(top_k * VECTOR_FETCH_MULTIPLIER)
+        trigram_fetch_k = int(top_k * (BM25_FETCH_BASE_MULTIPLIER + trigram_weight))
+
+        # 1. VDB semantic search (existing method)
+        vector_results = await self.query(query, top_k=vector_fetch_k)
+
+        # 2. pg_trgm character-level search on entity_name
+        trigram_sql = """
+            SELECT entity_name,
+                   EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at,
+                   similarity(LOWER(entity_name), LOWER($1)) AS trgm_score
+            FROM LIGHTRAG_VDB_ENTITY
+            WHERE workspace = $2
+              AND similarity(LOWER(entity_name), LOWER($1)) > $3
+            ORDER BY trgm_score DESC
+            LIMIT $4
+        """
+
+        db = self._db_required()
+        trigram_results = await db.query(
+            trigram_sql,
+            params=[query, self.workspace, min_trigram_similarity, trigram_fetch_k],
+            multirows=True,
+        )
+        trigram_results = trigram_results if trigram_results else []
+
+        # Mark source type for debugging
+        for r in vector_results:
+            r['source_type'] = 'vector'
+        for r in trigram_results:
+            r['source_type'] = 'trigram'
+
+        # 3. Combine using Reciprocal Rank Fusion
+        fused_results = reciprocal_rank_fusion(
+            [vector_results, trigram_results],
+            id_key='entity_name',
+            k=RRF_K,
+        )
+
+        logger.debug(
+            f'[{self.workspace}] Hybrid entity search for "{query}": {len(vector_results)} vector + '
+            f'{len(trigram_results)} trigram → {len(fused_results[:top_k])} fused'
+        )
+
+        return fused_results[:top_k]
+
     async def get_entity_linked_chunk_ids(
         self,
         keywords: list[str],
@@ -3329,9 +3717,18 @@ class PGVectorStorage(BaseVectorStorage):
                 logger.warning(f'[{self.workspace}] Entity search error for "{keyword}": {e}')
                 return []
 
-        # Run all keyword searches in parallel (N queries run concurrently instead of sequentially)
+        # Bound concurrent searches to avoid connection pool exhaustion
+        # Configurable via environment variable, defaults to 10
+        max_concurrent = int(os.getenv('LIGHTRAG_MAX_CONCURRENT_SEARCHES', '10'))
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def bounded_search(keyword: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                return await search_keyword(keyword)
+
+        # Run keyword searches in parallel with bounded concurrency
         start_time = time.perf_counter()
-        results_list = await asyncio.gather(*[search_keyword(kw) for kw in keywords])
+        results_list = await asyncio.gather(*[bounded_search(kw) for kw in keywords])
         elapsed = time.perf_counter() - start_time
 
         # Collect chunk IDs from all results
@@ -4434,26 +4831,33 @@ class PGGraphStorage(BaseGraphStorage):
                 # First ensure AGE extension is created
                 await PostgreSQLDB.configure_age_extension(connection)
 
+            # Defense-in-depth: validate graph_name before building DDL queries
+            # The validation chain is:
+            # 1. workspace validated by validate_workspace_name() in PostgreSQLDB.__init__
+            # 2. graph_name derived from workspace via _get_workspace_graph_name() which uses re.sub
+            # 3. This validate_sql_identifier() call provides defense-in-depth
+            graph_name = validate_sql_identifier(self.graph_name, 'graph_name')
+
             # Execute each statement separately and ignore errors
             queries = [
-                f"SELECT create_graph('{self.graph_name}')",
-                f"SELECT create_vlabel('{self.graph_name}', 'base');",
-                f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
-                # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
-                f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
-                f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
-                f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
-                f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
-                f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
-                f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
-                f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
-                f'CREATE UNIQUE INDEX CONCURRENTLY {self.graph_name}_entity_id_unique ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
+                f"SELECT create_graph('{graph_name}')",
+                f"SELECT create_vlabel('{graph_name}', 'base');",
+                f"SELECT create_elabel('{graph_name}', 'DIRECTED');",
+                # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {graph_name}."_ag_label_vertex" (id)',
+                f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {graph_name}."_ag_label_edge" (id)',
+                f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {graph_name}."_ag_label_edge" (start_id)',
+                f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {graph_name}."_ag_label_edge" (end_id)',
+                f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {graph_name}."_ag_label_edge" (start_id,end_id)',
+                f'CREATE INDEX CONCURRENTLY directed_p_idx ON {graph_name}."DIRECTED" (id)',
+                f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {graph_name}."DIRECTED" (end_id)',
+                f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {graph_name}."DIRECTED" (start_id)',
+                f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {graph_name}."DIRECTED" (start_id,end_id)',
+                f'CREATE INDEX CONCURRENTLY entity_p_idx ON {graph_name}."base" (id)',
+                f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {graph_name}."base" using gin(properties)',
+                f'CREATE UNIQUE INDEX CONCURRENTLY {graph_name}_entity_id_unique ON {graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                f'ALTER TABLE {graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
             ]
 
             for query in queries:
@@ -4541,8 +4945,9 @@ class PGGraphStorage(BaseGraphStorage):
                 )
                 if version_result and isinstance(version_result, dict):
                     age_version = version_result.get('extversion')
-            except Exception:
-                pass  # Version check is optional, don't fail health check
+            except (asyncpg.exceptions.PostgresError, asyncpg.exceptions.InterfaceError) as e:
+                # Version check is optional - don't fail health check
+                logger.debug(f'[{self.workspace}] AGE version check skipped: {e}')
 
             result['checks']['age_extension'] = {
                 'status': True,
@@ -4947,8 +5352,9 @@ class PGGraphStorage(BaseGraphStorage):
                 slow_threshold=2.0,  # Node upserts should be fast
             )
 
-        except Exception:
-            logger.error(f'[{self.workspace}] POSTGRES, upsert_node error on node_id: `{node_id}`')
+        except Exception as e:
+            # Log context before re-raising - intentionally broad to capture all database failures
+            logger.error(f'[{self.workspace}] POSTGRES, upsert_node error on node_id: `{node_id}`: {e}')
             raise
 
     # Note: Removed @retry decorator - _query() already has retry logic via _run_with_retry.
@@ -4983,9 +5389,11 @@ class PGGraphStorage(BaseGraphStorage):
                 slow_threshold=2.0,  # Edge upserts should be fast
             )
 
-        except Exception:
+        except Exception as e:
+            # Log context before re-raising - intentionally broad to capture all database failures
             logger.error(
-                f'[{self.workspace}] POSTGRES, upsert_edge error on edge: `{source_node_id}`-`{target_node_id}`'
+                f'[{self.workspace}] POSTGRES, upsert_edge error on edge: '
+                f'`{source_node_id}`-`{target_node_id}`: {e}'
             )
             raise
 
@@ -6350,6 +6758,15 @@ TABLES = {
                     CONSTRAINT confidence_range CHECK (confidence >= 0 AND confidence <= 1)
                     )"""
     },
+    # Schema migration tracking table - NOT workspace-scoped (global schema versioning)
+    'LIGHTRAG_SCHEMA_MIGRATIONS': {
+        'ddl': """CREATE TABLE LIGHTRAG_SCHEMA_MIGRATIONS (
+                    version INTEGER PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    checksum VARCHAR(64) NULL
+                    )"""
+    },
 }
 
 
@@ -6585,6 +7002,20 @@ SQL_TEMPLATES = {
             confidence = EXCLUDED.confidence,
             update_time = CURRENT_TIMESTAMP
         """,
+    'upsert_alias_extended': """
+        INSERT INTO LIGHTRAG_ENTITY_ALIASES
+            (workspace, alias, canonical_entity, method, confidence,
+             llm_reasoning, source_doc_id, entity_type, create_time, update_time)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+        ON CONFLICT (workspace, alias) DO UPDATE SET
+            canonical_entity = EXCLUDED.canonical_entity,
+            method = EXCLUDED.method,
+            confidence = EXCLUDED.confidence,
+            llm_reasoning = EXCLUDED.llm_reasoning,
+            source_doc_id = EXCLUDED.source_doc_id,
+            entity_type = EXCLUDED.entity_type,
+            update_time = CURRENT_TIMESTAMP
+        """,
     'get_aliases_for_canonical': """
         SELECT alias, method, confidence
         FROM LIGHTRAG_ENTITY_ALIASES
@@ -6621,29 +7052,30 @@ SQL_TEMPLATES = {
         """,
     # Note: Similarity calculation assumes cosine distance (1 - distance = similarity)
     # For L2 or inner product metrics, interpret the similarity column differently
-    'get_orphan_candidates': f"""
+    # Vector is embedded inline (not as parameter) because asyncpg can't convert strings to pgvector
+    'get_orphan_candidates': """
         SELECT e.id, e.entity_name, e.content,
-               1 - (e.content_vector {VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC]} $2::vector) AS similarity
+               1 - (e.content_vector {distance_op} '[{vector_str}]'::vector) AS similarity
         FROM LIGHTRAG_VDB_ENTITY e
         WHERE e.workspace = $1
-          AND e.entity_name != $3
-          AND 1 - (e.content_vector {VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC]} $2::vector) >= $4
-        ORDER BY e.content_vector {VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC]} $2::vector
-        LIMIT $5
+          AND e.entity_name != $2
+          AND 1 - (e.content_vector {distance_op} '[{vector_str}]'::vector) >= $3
+        ORDER BY e.content_vector {distance_op} '[{vector_str}]'::vector
+        LIMIT $4
         """,
-    'get_connected_candidates': f"""
+    'get_connected_candidates': """
         SELECT e.id, e.entity_name, e.content,
-               1 - (e.content_vector {VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC]} $2::vector) AS similarity
+               1 - (e.content_vector {distance_op} '[{vector_str}]'::vector) AS similarity
         FROM LIGHTRAG_VDB_ENTITY e
         WHERE e.workspace = $1
-          AND e.entity_name != $3
-          AND 1 - (e.content_vector {VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC]} $2::vector) >= $4
+          AND e.entity_name != $2
+          AND 1 - (e.content_vector {distance_op} '[{vector_str}]'::vector) >= $3
           AND EXISTS (
               SELECT 1 FROM LIGHTRAG_VDB_RELATION r
               WHERE r.workspace = $1
                 AND (r.source_id = e.entity_name OR r.target_id = e.entity_name)
           )
-        ORDER BY e.content_vector {VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC]} $2::vector
-        LIMIT $5
+        ORDER BY e.content_vector {distance_op} '[{vector_str}]'::vector
+        LIMIT $4
         """,
 }

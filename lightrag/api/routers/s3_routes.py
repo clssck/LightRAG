@@ -12,7 +12,6 @@ Endpoints:
 """
 
 import mimetypes
-import traceback
 from typing import Annotated
 
 from fastapi import (
@@ -26,7 +25,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
-from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.utils_api import get_combined_auth_dependency, handle_api_error
 from lightrag.storage.s3_client import S3Client
 from lightrag.utils import logger
 
@@ -105,6 +104,7 @@ def create_s3_routes(s3_client: S3Client, api_key: str | None = None) -> APIRout
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.get('/list', response_model=S3ListResponse, dependencies=[Depends(combined_auth)])
+    @handle_api_error('listing S3 objects')
     async def list_objects(
         prefix: str = Query(default='', description='S3 prefix to list (e.g., "staging/default/")'),
     ) -> S3ListResponse:
@@ -121,39 +121,32 @@ def create_s3_routes(s3_client: S3Client, api_key: str | None = None) -> APIRout
         Returns:
             S3ListResponse with folders (common prefixes) and objects at this level
         """
-        try:
-            result = await s3_client.list_objects(prefix=prefix, delimiter='/')
+        result = await s3_client.list_objects(prefix=prefix, delimiter='/')
 
-            # Convert to response model
-            objects = [
-                S3ObjectInfo(
-                    key=obj['key'],
-                    size=obj['size'],
-                    last_modified=obj['last_modified'],
-                    content_type=obj.get('content_type'),
-                )
-                for obj in result['objects']
-            ]
-
-            return S3ListResponse(
-                bucket=result['bucket'],
-                prefix=result['prefix'],
-                folders=result['folders'],
-                objects=objects,
+        # Convert to response model
+        objects = [
+            S3ObjectInfo(
+                key=obj['key'],
+                size=obj['size'],
+                last_modified=obj['last_modified'],
+                content_type=obj.get('content_type'),
             )
-        except Exception as e:
-            logger.error(f'Error listing S3 objects at prefix "{prefix}": {e!s}')
-            logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500,
-                detail=f'Error listing objects: {e!s}',
-            ) from e
+            for obj in result['objects']
+        ]
+
+        return S3ListResponse(
+            bucket=result['bucket'],
+            prefix=result['prefix'],
+            folders=result['folders'],
+            objects=objects,
+        )
 
     @router.get(
         '/download/{key:path}',
         response_model=S3DownloadResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @handle_api_error('generating download URL')
     async def get_download_url(
         key: str,
         expiry: int = Query(default=3600, description='URL expiry in seconds', ge=60, le=86400),
@@ -171,33 +164,24 @@ def create_s3_routes(s3_client: S3Client, api_key: str | None = None) -> APIRout
         Returns:
             S3DownloadResponse with presigned URL
         """
-        try:
-            # Check if object exists first
-            exists = await s3_client.object_exists(key)
-            if not exists:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f'Object not found: {key}',
-                )
-
-            url = await s3_client.get_presigned_url(key, expiry=expiry)
-
-            return S3DownloadResponse(
-                key=key,
-                url=url,
-                expiry_seconds=expiry,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f'Error generating download URL for "{key}": {e!s}')
-            logger.error(traceback.format_exc())
+        # Check if object exists first
+        exists = await s3_client.object_exists(key)
+        if not exists:
             raise HTTPException(
-                status_code=500,
-                detail=f'Error generating download URL: {e!s}',
-            ) from e
+                status_code=404,
+                detail=f'Object not found: {key}',
+            )
+
+        url = await s3_client.get_presigned_url(key, expiry=expiry)
+
+        return S3DownloadResponse(
+            key=key,
+            url=url,
+            expiry_seconds=expiry,
+        )
 
     @router.post('/upload', response_model=S3UploadResponse, dependencies=[Depends(combined_auth)])
+    @handle_api_error('uploading file to S3')
     async def upload_file(
         file: Annotated[UploadFile, File(description='File to upload')],
         prefix: Annotated[str, Form(description='S3 prefix path (e.g., "staging/default/")')] = '',
@@ -215,60 +199,51 @@ def create_s3_routes(s3_client: S3Client, api_key: str | None = None) -> APIRout
         Returns:
             S3UploadResponse with the key where file was uploaded
         """
-        try:
-            # Read file content
-            content = await file.read()
-            if not content:
-                raise HTTPException(
-                    status_code=400,
-                    detail='Empty file uploaded',
-                )
-
-            # Sanitize filename
-            filename = file.filename or 'unnamed'
-            safe_filename = filename.replace('/', '_').replace('\\', '_')
-
-            # Construct key
-            key = f'{prefix}{safe_filename}' if prefix else safe_filename
-
-            # Detect content type
-            content_type = file.content_type
-            if not content_type or content_type == 'application/octet-stream':
-                guessed_type, _ = mimetypes.guess_type(filename)
-                content_type = guessed_type or 'application/octet-stream'
-
-            # Upload to S3
-            await s3_client.upload_object(
-                key=key,
-                data=content,
-                content_type=content_type,
-            )
-
-            # Generate presigned URL for immediate access
-            url = await s3_client.get_presigned_url(key)
-
-            logger.info(f'Uploaded file to S3: {key} ({len(content)} bytes)')
-
-            return S3UploadResponse(
-                key=key,
-                size=len(content),
-                url=url,
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f'Error uploading file to S3: {e!s}')
-            logger.error(traceback.format_exc())
+        # Read file content
+        content = await file.read()
+        if not content:
             raise HTTPException(
-                status_code=500,
-                detail=f'Error uploading file: {e!s}',
-            ) from e
+                status_code=400,
+                detail='Empty file uploaded',
+            )
+
+        # Sanitize filename
+        filename = file.filename or 'unnamed'
+        safe_filename = filename.replace('/', '_').replace('\\', '_')
+
+        # Construct key
+        key = f'{prefix}{safe_filename}' if prefix else safe_filename
+
+        # Detect content type
+        content_type = file.content_type
+        if not content_type or content_type == 'application/octet-stream':
+            guessed_type, _ = mimetypes.guess_type(filename)
+            content_type = guessed_type or 'application/octet-stream'
+
+        # Upload to S3
+        await s3_client.upload_object(
+            key=key,
+            data=content,
+            content_type=content_type,
+        )
+
+        # Generate presigned URL for immediate access
+        url = await s3_client.get_presigned_url(key)
+
+        logger.info(f'Uploaded file to S3: {key} ({len(content)} bytes)')
+
+        return S3UploadResponse(
+            key=key,
+            size=len(content),
+            url=url,
+        )
 
     @router.delete(
         '/object/{key:path}',
         response_model=S3DeleteResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @handle_api_error('deleting S3 object')
     async def delete_object(key: str) -> S3DeleteResponse:
         """
         Delete an object from S3.
@@ -283,26 +258,17 @@ def create_s3_routes(s3_client: S3Client, api_key: str | None = None) -> APIRout
         """
         try:
             await s3_client.delete_object(key)
-
-            logger.info(f'Deleted S3 object: {key}')
-
-            return S3DeleteResponse(
-                key=key,
-                status='deleted',
-            )
         except FileNotFoundError as e:
             raise HTTPException(
                 status_code=404,
                 detail=f'Object not found: {key}',
             ) from e
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f'Error deleting S3 object "{key}": {e!s}')
-            logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500,
-                detail=f'Error deleting object: {e!s}',
-            ) from e
+
+        logger.info(f'Deleted S3 object: {key}')
+
+        return S3DeleteResponse(
+            key=key,
+            status='deleted',
+        )
 
     return router

@@ -10,7 +10,11 @@ from multiprocessing.managers import DictProxy, SyncManager
 from multiprocessing.synchronize import Lock as ProcessLock
 from typing import Any, Generic, TypeVar, cast
 
-from lightrag.exceptions import PipelineNotInitializedError
+from lightrag.constants import NS_ORPHAN_CONNECTION_STATUS, NS_PIPELINE_STATUS
+from lightrag.exceptions import LockTimeoutError, PipelineCancelledException, PipelineNotInitializedError
+
+# Lock acquisition timeout (configurable via environment variable)
+LOCK_TIMEOUT = float(os.getenv('LIGHTRAG_LOCK_TIMEOUT', '30'))
 
 DEBUG_LOCKS = False
 
@@ -802,12 +806,15 @@ class _KeyedLockContext:
                     }
                     self._ul.append(entry)  # Add immediately after _get_lock_for_key for rollback to work
 
-                    # 3. Try to acquire the lock
+                    # 3. Try to acquire the lock with timeout to prevent deadlocks
                     # Use try-finally to ensure state is updated atomically
                     lock_acquired = False
                     try:
-                        await lock.__aenter__()
+                        await asyncio.wait_for(lock.__aenter__(), timeout=LOCK_TIMEOUT)
                         lock_acquired = True  # Lock successfully acquired
+                    except TimeoutError:
+                        # Convert to LockTimeoutError with context
+                        raise LockTimeoutError(key, LOCK_TIMEOUT)
                     finally:
                         if lock_acquired:
                             entry['entered'] = True
@@ -819,6 +826,14 @@ class _KeyedLockContext:
                     # The finally block above ensures entry["entered"] is correct
                     direct_log(
                         f'Lock acquisition cancelled for key {key}',
+                        level='WARNING',
+                        enable_output=self._enable_logging,
+                    )
+                    raise
+                except LockTimeoutError:
+                    # Lock timeout - log and re-raise
+                    direct_log(
+                        f'Lock acquisition timed out for key {key} after {LOCK_TIMEOUT}s',
                         level='WARNING',
                         enable_output=self._enable_logging,
                     )
@@ -1204,7 +1219,7 @@ async def initialize_pipeline_status(workspace: str | None = None):
                    If None or empty string, uses the default workspace set by
                    set_default_workspace().
     """
-    pipeline_namespace = await get_namespace_data('pipeline_status', first_init=True, workspace=workspace)
+    pipeline_namespace = await get_namespace_data(NS_PIPELINE_STATUS, first_init=True, workspace=workspace)
 
     async with get_internal_lock():
         # Check if already initialized by checking for required fields
@@ -1229,8 +1244,53 @@ async def initialize_pipeline_status(workspace: str | None = None):
             }
         )
 
-        final_namespace = get_final_namespace('pipeline_status', workspace)
+        final_namespace = get_final_namespace(NS_PIPELINE_STATUS, workspace)
         direct_log(f"Process {os.getpid()} Pipeline namespace '{final_namespace}' initialized")
+
+
+async def update_pipeline_status(
+    pipeline_status: dict | None,
+    pipeline_status_lock: asyncio.Lock | None,
+    message: str,
+) -> None:
+    """Update pipeline status with a new message.
+
+    This helper reduces boilerplate for the common pattern of updating
+    pipeline_status['latest_message'] and appending to history_messages.
+
+    Args:
+        pipeline_status: Pipeline status dict (or None if not available)
+        pipeline_status_lock: Lock for thread-safe updates (or None)
+        message: Status message to record
+    """
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            pipeline_status['latest_message'] = message
+            pipeline_status['history_messages'].append(message)
+
+
+async def check_pipeline_cancellation(
+    pipeline_status: dict | None,
+    pipeline_status_lock: asyncio.Lock | None,
+    stage: str,
+) -> None:
+    """Check if pipeline cancellation was requested and raise if so.
+
+    This helper reduces boilerplate for the common pattern of checking
+    cancellation_requested flag before expensive operations.
+
+    Args:
+        pipeline_status: Pipeline status dict (or None if not available)
+        pipeline_status_lock: Lock for thread-safe reads (or None)
+        stage: Description of current stage for error message
+
+    Raises:
+        PipelineCancelledException: If cancellation was requested
+    """
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            if pipeline_status.get('cancellation_requested', False):
+                raise PipelineCancelledException(f'User cancelled during {stage}')
 
 
 async def initialize_orphan_connection_status(workspace: str | None = None):
@@ -1243,7 +1303,7 @@ async def initialize_orphan_connection_status(workspace: str | None = None):
                    If None or empty string, uses the default workspace set by
                    set_default_workspace().
     """
-    orphan_namespace = await get_namespace_data('orphan_connection_status', first_init=True, workspace=workspace)
+    orphan_namespace = await get_namespace_data(NS_ORPHAN_CONNECTION_STATUS, first_init=True, workspace=workspace)
 
     async with get_internal_lock():
         # Check if already initialized by checking for required fields
@@ -1268,7 +1328,7 @@ async def initialize_orphan_connection_status(workspace: str | None = None):
             }
         )
 
-        final_namespace = get_final_namespace('orphan_connection_status', workspace)
+        final_namespace = get_final_namespace(NS_ORPHAN_CONNECTION_STATUS, workspace)
         direct_log(f"Process {os.getpid()} Orphan connection namespace '{final_namespace}' initialized")
 
 
@@ -1423,7 +1483,7 @@ async def get_namespace_data(namespace: str, first_init: bool = False, workspace
         if final_namespace not in _shared_dicts:
             # Special handling for pipeline_status namespace
             if (
-                final_namespace.endswith(':pipeline_status') or final_namespace == 'pipeline_status'
+                final_namespace.endswith(f':{NS_PIPELINE_STATUS}') or final_namespace == NS_PIPELINE_STATUS
             ) and not first_init:
                 # Check if pipeline_status should have been initialized but wasn't
                 # This helps users to call initialize_pipeline_status() before get_namespace_data()
@@ -1566,11 +1626,11 @@ def finalize_share_data():
             if _shared_dicts is not None:
                 # Clear pipeline status history messages first if exists
                 try:
-                    pipeline_status = _shared_dicts.get('pipeline_status', {})
+                    pipeline_status = _shared_dicts.get(NS_PIPELINE_STATUS, {})
                     if 'history_messages' in pipeline_status:
                         pipeline_status['history_messages'].clear()
-                except Exception:
-                    pass  # Ignore any errors during history messages cleanup
+                except (KeyError, TypeError, AttributeError, OSError):
+                    pass  # Ignore multiprocess cleanup errors during shutdown
                 _shared_dicts.clear()
             if _init_flags is not None:
                 _init_flags.clear()
@@ -1585,8 +1645,8 @@ def finalize_share_data():
                                 if hasattr(flag, 'value'):  # Check if it's a Value object
                                     flag.value = False
                             flags_list.clear()
-                except Exception:
-                    pass  # Ignore any errors during update flags cleanup
+                except (KeyError, TypeError, AttributeError, OSError):
+                    pass  # Ignore multiprocess cleanup errors during shutdown
                 _update_flags.clear()
 
             # Shut down the Manager - this will automatically clean up all shared resources
@@ -1649,4 +1709,4 @@ def get_pipeline_status_lock(enable_logging: bool = False, workspace: str | None
     """
     global _default_workspace
     actual_workspace = workspace if workspace else _default_workspace
-    return get_namespace_lock('pipeline_status', workspace=actual_workspace, enable_logging=enable_logging)
+    return get_namespace_lock(NS_PIPELINE_STATUS, workspace=actual_workspace, enable_logging=enable_logging)

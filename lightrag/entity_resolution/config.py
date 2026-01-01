@@ -1,78 +1,44 @@
 """Configuration for Entity Resolution
 
 Uses the same LLM that LightRAG is configured with - no separate model config needed.
+
+All entity resolution is LLM-based:
+- Cache check first (instant, free)
+- VDB similarity search for candidates
+- LLM batch review for decisions
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class EntityResolutionConfig:
-    """Configuration for the entity resolution system."""
+    """Configuration for the LLM-based entity resolution system."""
 
     # Whether entity resolution is enabled
     enabled: bool = True
-
-    # Fuzzy pre-resolution: Enable/disable within-batch fuzzy matching before
-    # VDB lookup. When enabled, entities in the same batch are matched by string
-    # similarity alone. Set to False to skip fuzzy pre-resolution entirely (only
-    # exact case-insensitive matches will be accepted within batch; all other
-    # resolution goes to VDB/LLM). Disabling reduces false positives but may
-    # miss obvious typo corrections.
-    fuzzy_pre_resolution_enabled: bool = True
-
-    # Fuzzy string matching threshold (0-1)
-    # Above this = auto-match (catches typos like Dupixant/Dupixent at 0.88)
-    # Below this = continue to vector search
-    # Tuning advice:
-    #   0.90+ = Very conservative, near-identical strings (Dupixent/Dupixant)
-    #   0.85  = Balanced default, catches typos, avoids most false positives
-    #   0.80  = Aggressive, may merge distinct entities with similar names
-    #   <0.75 = Not recommended, high false positive risk (Celebrex/Cerebyx=0.67)
-    # Test with your domain data; pharmaceutical names need higher thresholds.
-    fuzzy_threshold: float = 0.85
-
-    # Vector similarity threshold for finding candidates
-    # Low threshold = cast wide net, LLM will verify
-    # 0.5 catches FDA/US Food and Drug Administration at 0.67
-    vector_threshold: float = 0.5
-
-    # Maximum number of vector candidates to verify with LLM
-    # Limits cost - uses same LLM as LightRAG main config
-    max_candidates: int = 3
-
-    # LLM verification prompt template
-    llm_prompt_template: str | None = field(
-        default="""Are these two terms referring to the same entity?
-Consider typos, misspellings, abbreviations, or alternate names.
-
-Term A: {term_a}
-Term B: {term_b}
-
-Answer only YES or NO.""",
-    )
-
-    # Abbreviation detection: Enable/disable Layer 1.5 abbreviation matching
-    # Runs after exact match but before fuzzy matching
-    # Catches patterns like: FDA → US Food and Drug Administration
-    abbreviation_detection_enabled: bool = True
-
-    # Minimum confidence for abbreviation matches (0-1)
-    # Higher = fewer false positives but may miss valid abbreviations
-    # 0.80 = balanced default
-    abbreviation_min_confidence: float = 0.80
 
     # Auto-resolve during extraction: When enabled, automatically resolve
     # entity aliases during document extraction/indexing
     auto_resolve_on_extraction: bool = True
 
-    # Batch size for entity resolution during extraction
-    # Larger batches = fewer VDB queries but more memory
-    batch_size: int = 100
+    # Number of entities to review in a single LLM call
+    # Larger = more efficient but may hit context limits
+    batch_size: int = 20
 
-    # Skip LLM verification for high-confidence matches
-    # If abbreviation or fuzzy confidence >= this threshold, skip LLM call
-    skip_llm_threshold: float = 0.95
+    # Number of VDB candidates to retrieve per entity for LLM review
+    # More candidates = better recall but more tokens
+    # Increased from 5 to 10 to catch abbreviation-expansion pairs
+    candidates_per_entity: int = 10
+
+    # Minimum confidence for LLM to auto-apply an alias
+    # Below this: alias is suggested but not auto-applied
+    min_confidence: float = 0.85
+
+    # Automatically apply LLM alias decisions
+    # When True: Matching entities are merged automatically
+    # When False: Aliases are stored but require manual verification
+    auto_apply: bool = True
 
 
 # Default configuration

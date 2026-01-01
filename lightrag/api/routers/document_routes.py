@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from lightrag import LightRAG
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.base import DeletionResult, DocStatus
+from lightrag.constants import NS_PIPELINE_STATUS
 from lightrag.utils import (
     compute_mdhash_id,
     generate_track_id,
@@ -873,7 +874,7 @@ async def pipeline_enqueue_file(
         # Get file size for error reporting
         try:
             file_size = file_path.stat().st_size
-        except Exception:
+        except OSError:
             file_size = 0
 
         file = None
@@ -1118,7 +1119,7 @@ async def pipeline_enqueue_file(
         # Catch-all for any unexpected errors
         try:
             file_size = file_path.stat().st_size if file_path.exists() else 0
-        except Exception:
+        except OSError:
             file_size = 0
 
         error_files = [
@@ -1284,8 +1285,8 @@ async def background_delete_documents(
         get_namespace_lock,
     )
 
-    pipeline_status = await get_namespace_data('pipeline_status', workspace=rag.workspace)
-    pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=rag.workspace)
+    pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=rag.workspace)
+    pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=rag.workspace)
 
     total_docs = len(doc_ids)
     successful_deletions = []
@@ -1767,8 +1768,8 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
         )
 
         # Get pipeline status and lock
-        pipeline_status = await get_namespace_data('pipeline_status', workspace=rag.workspace)
-        pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=rag.workspace)
+        pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=rag.workspace)
+        pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=rag.workspace)
 
         # Check and set status with lock
         async with pipeline_status_lock:
@@ -1953,8 +1954,8 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
                 get_namespace_lock,
             )
 
-            pipeline_status = await get_namespace_data('pipeline_status', workspace=rag.workspace)
-            pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=rag.workspace)
+            pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=rag.workspace)
+            pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=rag.workspace)
 
             # Get update flags status for all namespaces
             update_status = await get_all_update_flags_status(workspace=rag.workspace)
@@ -2059,8 +2060,8 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
                 get_namespace_lock,
             )
 
-            pipeline_status = await get_namespace_data('pipeline_status', workspace=rag.workspace)
-            pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=rag.workspace)
+            pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=rag.workspace)
+            pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=rag.workspace)
 
             # Check if pipeline is busy with proper lock
             async with pipeline_status_lock:
@@ -2466,8 +2467,8 @@ def create_document_routes(rag: LightRAG, doc_manager: DocumentManager, api_key:
                 get_namespace_lock,
             )
 
-            pipeline_status = await get_namespace_data('pipeline_status', workspace=rag.workspace)
-            pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=rag.workspace)
+            pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=rag.workspace)
+            pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=rag.workspace)
 
             async with pipeline_status_lock:
                 if not pipeline_status.get('busy', False):

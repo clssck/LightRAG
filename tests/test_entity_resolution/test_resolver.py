@@ -1,954 +1,1262 @@
-"""
-Unit tests for Entity Resolution
+"""Tests for Entity Resolution Resolver Module.
 
-Tests the 3-layer approach with mock embed_fn and llm_fn.
-No database or external services required.
+Covers:
+1. JSON response parsing (_parse_llm_json_response)
+2. Alias cache operations (get_cached_alias, store_alias)
+3. LLM batch review (llm_review_entities_batch)
+4. LLM pair review (llm_review_entity_pairs)
+5. Main resolution flow (resolve_entity)
+6. Edge cases and security scenarios
+
+These are unit tests using mocks - no database required.
 """
+
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from lightrag.entity_resolution import (
-    EntityResolutionConfig,
+from lightrag.entity_resolution.config import DEFAULT_CONFIG, EntityResolutionConfig
+from lightrag.entity_resolution.resolver import (
+    _parse_llm_json_response,
+    get_cached_alias,
+    llm_review_entities_batch,
+    llm_review_entity_pairs,
     resolve_entity,
+    store_alias,
 )
 
-# Mock embeddings - pre-computed for test entities
-# These simulate what an embedding model would return
-MOCK_EMBEDDINGS = {
-    # FDA and full name have ~0.67 similarity (based on real test)
-    'fda': [0.1, 0.2, 0.3, 0.4, 0.5],
-    'us food and drug administration': [0.15, 0.25, 0.28, 0.38, 0.52],
-    # Dupixent and dupilumab have ~0.63 similarity
-    'dupixent': [0.5, 0.6, 0.7, 0.8, 0.9],
-    'dupilumab': [0.48, 0.58, 0.72, 0.78, 0.88],
-    # Celebrex and Cerebyx are different (low similarity)
-    'celebrex': [0.9, 0.1, 0.2, 0.3, 0.4],
-    'cerebyx': [0.1, 0.9, 0.8, 0.7, 0.6],
-    # Default for unknown entities
-    'default': [0.0, 0.0, 0.0, 0.0, 0.0],
-}
-
-# Mock LLM responses
-MOCK_LLM_RESPONSES = {
-    ('fda', 'us food and drug administration'): 'YES',
-    ('us food and drug administration', 'fda'): 'YES',
-    ('dupixent', 'dupilumab'): 'YES',
-    ('dupilumab', 'dupixent'): 'YES',
-    ('heart attack', 'myocardial infarction'): 'YES',
-    ('celebrex', 'cerebyx'): 'NO',
-    ('metformin', 'metoprolol'): 'NO',
-}
-
-
-async def mock_embed_fn(text: str) -> list[float]:
-    """Mock embedding function."""
-    key = text.lower().strip()
-    return MOCK_EMBEDDINGS.get(key, MOCK_EMBEDDINGS['default'])
-
-
-async def mock_llm_fn(prompt: str) -> str:
-    """Mock LLM function that parses the prompt and returns YES/NO."""
-    # Extract term_a and term_b from the prompt
-    lines = prompt.strip().split('\n')
-    term_a = None
-    term_b = None
-    for line in lines:
-        if line.startswith('Term A:'):
-            term_a = line.replace('Term A:', '').strip().lower()
-        elif line.startswith('Term B:'):
-            term_b = line.replace('Term B:', '').strip().lower()
-
-    if term_a and term_b:
-        # Check both orderings
-        response = MOCK_LLM_RESPONSES.get((term_a, term_b))
-        if response is None:
-            response = MOCK_LLM_RESPONSES.get((term_b, term_a), 'NO')
-        return response
-    return 'NO'
-
-
-# Test fixtures
-@pytest.fixture
-def existing_entities():
-    """Existing entities in the knowledge graph."""
-    return [
-        (
-            'US Food and Drug Administration',
-            MOCK_EMBEDDINGS['us food and drug administration'],
-        ),
-        ('Dupixent', MOCK_EMBEDDINGS['dupixent']),
-        ('Celebrex', MOCK_EMBEDDINGS['celebrex']),
-    ]
+# --- Fixtures ---
 
 
 @pytest.fixture
-def config():
-    """Default resolution config."""
-    return EntityResolutionConfig()
+def mock_db():
+    """Create a mock PostgresDB instance."""
+    db = MagicMock()
+    db.query = AsyncMock(return_value=None)
+    db.execute = AsyncMock()
+    return db
 
 
-# Layer 1: Case normalization tests
-class TestCaseNormalization:
-    @pytest.mark.asyncio
-    async def test_exact_match_same_case(self, existing_entities, config):
-        """Exact match with same case."""
-        result = await resolve_entity(
-            'Dupixent',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'Dupixent'
-        assert result.method == 'exact'
-        assert result.confidence == 1.0
-
-    @pytest.mark.asyncio
-    async def test_exact_match_different_case(self, existing_entities, config):
-        """DUPIXENT should match Dupixent via case normalization."""
-        result = await resolve_entity(
-            'DUPIXENT',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'Dupixent'
-        assert result.method == 'exact'
-
-    @pytest.mark.asyncio
-    async def test_exact_match_lowercase(self, existing_entities, config):
-        """dupixent should match Dupixent."""
-        result = await resolve_entity(
-            'dupixent',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.method == 'exact'
+@pytest.fixture
+def mock_llm_fn():
+    """Create a mock LLM function that returns empty array by default."""
+    return AsyncMock(return_value='[]')
 
 
-# Layer 2: Fuzzy matching tests
-class TestFuzzyMatching:
-    @pytest.mark.asyncio
-    async def test_fuzzy_match_typo(self, existing_entities, config):
-        """Dupixant (typo) should match Dupixent via fuzzy matching (88%)."""
-        result = await resolve_entity(
-            'Dupixant',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'Dupixent'
-        assert result.method == 'fuzzy'
-        assert result.confidence >= 0.85
-
-    @pytest.mark.asyncio
-    async def test_fuzzy_rejects_below_threshold(self, existing_entities, config):
-        """Celebrex vs Cerebyx is 67% - should NOT fuzzy match."""
-        # Add Cerebyx as the query (Celebrex exists)
-        result = await resolve_entity(
-            'Cerebyx',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        # Should not be fuzzy match (67% < 85%)
-        assert result.method != 'fuzzy' or result.action == 'new'
+@pytest.fixture
+def mock_entity_vdb():
+    """Create a mock vector database for entity search."""
+    vdb = MagicMock()
+    vdb.query = AsyncMock(return_value=[])
+    vdb.hybrid_entity_search = AsyncMock(return_value=[])
+    return vdb
 
 
-# Layer 1.5: Abbreviation detection tests
-class TestAbbreviationDetection:
-    @pytest.mark.asyncio
-    async def test_abbreviation_catches_acronym(self, existing_entities, config):
-        """FDA should match US Food and Drug Administration via abbreviation detection."""
-        result = await resolve_entity(
-            'FDA',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'US Food and Drug Administration'
-        assert result.method == 'abbreviation'
-
-    @pytest.mark.asyncio
-    async def test_abbreviation_disabled_falls_through_to_llm(self, existing_entities):
-        """When abbreviation detection disabled, LLM should catch the match."""
-        config = EntityResolutionConfig(abbreviation_detection_enabled=False)
-        result = await resolve_entity(
-            'FDA',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'US Food and Drug Administration'
-        assert result.method == 'llm'
-
-    @pytest.mark.asyncio
-    async def test_abbreviation_confidence_threshold(self, existing_entities):
-        """High confidence threshold should reject weak matches."""
-        config = EntityResolutionConfig(abbreviation_min_confidence=0.99)
-        result = await resolve_entity(
-            'FDA',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        # FDA → USFDA is subsequence match (0.80 confidence), should fail threshold
-        # Will fall through to LLM
-        assert result.method in ('llm', 'abbreviation')  # Either is acceptable
+@pytest.fixture
+def disabled_config():
+    """Configuration with entity resolution disabled."""
+    return EntityResolutionConfig(enabled=False)
 
 
-# Layer 3: LLM verification tests
-class TestLLMVerification:
-    @pytest.mark.asyncio
-    async def test_llm_matches_acronym_when_abbrev_disabled(self, existing_entities):
-        """FDA should match via LLM when abbreviation detection is disabled."""
-        config = EntityResolutionConfig(abbreviation_detection_enabled=False)
-        result = await resolve_entity(
-            'FDA',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'US Food and Drug Administration'
-        assert result.method == 'llm'
-
-    @pytest.mark.asyncio
-    async def test_llm_matches_brand_generic(self, config):
-        """Dupixent should match dupilumab via LLM."""
-        existing = [
-            ('dupilumab', MOCK_EMBEDDINGS['dupilumab']),
-        ]
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'match'
-        assert result.matched_entity == 'dupilumab'
-        assert result.method == 'llm'
+@pytest.fixture
+def config_low_confidence():
+    """Configuration with low confidence threshold."""
+    return EntityResolutionConfig(min_confidence=0.5)
 
 
-# Edge cases
-class TestEdgeCases:
-    @pytest.mark.asyncio
-    async def test_empty_existing_entities(self, config):
-        """New entity when no existing entities."""
-        result = await resolve_entity(
-            'NewEntity',
-            [],
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert result.action == 'new'
+@pytest.fixture
+def config_no_auto_apply():
+    """Configuration with auto_apply disabled."""
+    return EntityResolutionConfig(auto_apply=False)
+
+
+# --- TestParseLLMJsonResponse ---
+
+
+class TestParseLLMJsonResponse:
+    """Tests for _parse_llm_json_response function."""
+
+    def test_valid_json_array(self):
+        """Valid JSON array should parse correctly."""
+        response = '[{"new_entity": "FDA", "matches_existing": true, "canonical": "US FDA"}]'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'FDA'
+        assert result[0]['matches_existing'] is True
+
+    def test_valid_json_object_wrapped_in_list(self):
+        """Single JSON object should be wrapped in a list."""
+        response = '{"new_entity": "FDA", "matches_existing": false}'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'FDA'
+
+    def test_markdown_code_block_json(self):
+        """JSON in markdown code block should be extracted."""
+        response = '```json\n[{"new_entity": "Apple", "canonical": "Apple Inc"}]\n```'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'Apple'
+
+    def test_markdown_code_block_no_language(self):
+        """Markdown code block without language spec should work."""
+        response = '```\n[{"new_entity": "Test"}]\n```'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'Test'
+
+    def test_whitespace_handling(self):
+        """Leading/trailing whitespace should be stripped."""
+        response = '   \n  [{"new_entity": "Test"}]  \n   '
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'Test'
+
+    def test_invalid_json_returns_empty(self):
+        """Invalid JSON should return empty list."""
+        response = 'This is not JSON at all'
+        result = _parse_llm_json_response(response)
+        assert result == []
+
+    def test_empty_string_returns_empty(self):
+        """Empty string should return empty list."""
+        result = _parse_llm_json_response('')
+        assert result == []
+
+    def test_embedded_json_in_prose(self):
+        """JSON embedded in prose should be extracted."""
+        response = 'Here are the results:\n[{"new_entity": "Test"}]\nEnd of results.'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'Test'
+
+    def test_unicode_in_json(self):
+        """Unicode characters in JSON should be handled."""
+        response = '[{"new_entity": "北京", "canonical": "Beijing"}]'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == '北京'
+
+    def test_special_characters_in_json(self):
+        """Special characters should be handled."""
+        response = '[{"new_entity": "AT&T", "canonical": "AT&T Inc."}]'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'AT&T'
+
+    def test_multiple_items_array(self):
+        """Multiple items in array should all be returned."""
+        response = '[{"new_entity": "A"}, {"new_entity": "B"}, {"new_entity": "C"}]'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 3
+
+    def test_nested_json_objects(self):
+        """Nested objects should be preserved."""
+        response = '[{"new_entity": "Test", "metadata": {"key": "value"}}]'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['metadata']['key'] == 'value'
+
+    def test_non_list_non_dict_returns_empty(self):
+        """Non-list, non-dict JSON should return empty."""
+        response = '"just a string"'
+        result = _parse_llm_json_response(response)
+        assert result == []
+
+    def test_partial_json_recovery(self):
+        """Partial/malformed JSON with valid array should attempt recovery."""
+        response = 'Some text [{"new_entity": "Test"}] more text'
+        result = _parse_llm_json_response(response)
+        assert len(result) == 1
+        assert result[0]['new_entity'] == 'Test'
+
+
+# --- TestGetCachedAlias ---
+
+
+class TestGetCachedAlias:
+    """Tests for get_cached_alias function."""
 
     @pytest.mark.asyncio
-    async def test_disabled_resolution(self, existing_entities):
-        """Resolution disabled returns new."""
-        config = EntityResolutionConfig(enabled=False)
-        result = await resolve_entity(
-            'Dupixent',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
+    async def test_cache_hit_returns_tuple(self, mock_db):
+        """Cache hit should return (canonical, method, confidence)."""
+        mock_db.query = AsyncMock(
+            return_value={
+                'canonical_entity': 'US Food and Drug Administration',
+                'method': 'llm',
+                'confidence': 0.95,
+            }
         )
+
+        result = await get_cached_alias('fda', mock_db, 'default')
+
+        assert result is not None
+        assert result[0] == 'US Food and Drug Administration'
+        assert result[1] == 'llm'
+        assert result[2] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_returns_none(self, mock_db):
+        """Cache miss should return None."""
+        mock_db.query = AsyncMock(return_value=None)
+
+        result = await get_cached_alias('unknown_entity', mock_db, 'default')
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unicode_normalization_applied(self, mock_db):
+        """Unicode normalization should be applied before lookup."""
+        mock_db.query = AsyncMock(return_value=None)
+
+        # Call with unicode variant (full-width characters)
+        await get_cached_alias('ＦＤＡ', mock_db, 'default')
+
+        # Verify the normalized form was used in query
+        mock_db.query.assert_called_once()
+        call_args = mock_db.query.call_args
+        # The params should contain the normalized, lowercased, stripped alias
+        params = call_args.kwargs.get('params') or call_args.args[1]
+        # normalize_unicode_for_entity_matching lowercases but preserves full-width
+        # Full-width 'ＦＤＡ' → 'ｆｄａ' (lowercased full-width)
+        assert 'ｆｄａ' in params or params[1] == 'ｆｄａ'
+
+    @pytest.mark.asyncio
+    async def test_case_normalization_applied(self, mock_db):
+        """Case should be normalized (lowercased)."""
+        mock_db.query = AsyncMock(return_value=None)
+
+        await get_cached_alias('FDA', mock_db, 'default')
+
+        mock_db.query.assert_called_once()
+        call_args = mock_db.query.call_args
+        params = call_args.kwargs.get('params') or call_args.args[1]
+        assert 'fda' in params or params[1] == 'fda'
+
+    @pytest.mark.asyncio
+    async def test_database_error_returns_none(self, mock_db):
+        """Database error should return None gracefully."""
+        mock_db.query = AsyncMock(side_effect=Exception('DB connection failed'))
+
+        result = await get_cached_alias('test', mock_db, 'default')
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_correct_sql_template_used(self, mock_db):
+        """Should use the get_alias SQL template (imports inside function)."""
+        mock_db.query = AsyncMock(return_value=None)
+
+        # The SQL_TEMPLATES is imported inside the function so we can't easily patch it
+        # Instead, verify that query was called with expected workspace and alias
+        await get_cached_alias('test', mock_db, 'workspace1')
+
+        mock_db.query.assert_called_once()
+        call_args = mock_db.query.call_args
+        # First arg should be SQL string, second should be params
+        sql = call_args.args[0]
+        params = call_args.kwargs.get('params') or call_args.args[1]
+        # Verify SQL looks like a SELECT query and params include workspace/alias
+        assert isinstance(sql, str)
+        assert 'workspace1' in params
+        assert 'test' in params
+
+    @pytest.mark.asyncio
+    async def test_workspace_passed_correctly(self, mock_db):
+        """Workspace should be passed as first parameter."""
+        mock_db.query = AsyncMock(return_value=None)
+
+        await get_cached_alias('entity', mock_db, 'my_workspace')
+
+        mock_db.query.assert_called_once()
+        call_args = mock_db.query.call_args
+        params = call_args.kwargs.get('params') or call_args.args[1]
+        assert 'my_workspace' in params or params[0] == 'my_workspace'
+
+    @pytest.mark.asyncio
+    async def test_whitespace_stripping(self, mock_db):
+        """Whitespace should be stripped from alias."""
+        mock_db.query = AsyncMock(return_value=None)
+
+        await get_cached_alias('  FDA  ', mock_db, 'default')
+
+        mock_db.query.assert_called_once()
+        call_args = mock_db.query.call_args
+        params = call_args.kwargs.get('params') or call_args.args[1]
+        assert 'fda' in params or params[1] == 'fda'
+
+
+# --- TestStoreAlias ---
+
+
+class TestStoreAlias:
+    """Tests for store_alias function."""
+
+    @pytest.mark.asyncio
+    async def test_store_new_alias(self, mock_db):
+        """New alias should be stored correctly."""
+        await store_alias(
+            alias='FDA',
+            canonical='US Food and Drug Administration',
+            method='llm',
+            confidence=0.95,
+            db=mock_db,
+            workspace='default',
+        )
+
+        mock_db.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_skip_self_referential_alias(self, mock_db):
+        """Self-referential aliases (same name) should not be stored."""
+        await store_alias(
+            alias='FDA',
+            canonical='FDA',
+            method='llm',
+            confidence=1.0,
+            db=mock_db,
+            workspace='default',
+        )
+
+        mock_db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skip_self_referential_case_insensitive(self, mock_db):
+        """Self-referential check should be case-insensitive."""
+        await store_alias(
+            alias='fda',
+            canonical='FDA',
+            method='llm',
+            confidence=1.0,
+            db=mock_db,
+            workspace='default',
+        )
+
+        mock_db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unicode_normalization_in_storage(self, mock_db):
+        """Unicode normalization should be applied before storage."""
+        await store_alias(
+            alias='ＦＤＡ',  # Full-width
+            canonical='US Food and Drug Administration',
+            method='llm',
+            confidence=0.9,
+            db=mock_db,
+            workspace='default',
+        )
+
+        mock_db.execute.assert_called_once()
+        call_args = mock_db.execute.call_args
+        data = call_args.kwargs.get('data') or call_args.args[1]
+        # normalize_unicode_for_entity_matching lowercases but preserves full-width
+        # Full-width 'ＦＤＡ' → 'ｆｄａ' (lowercased full-width)
+        assert data['alias'] == 'ｆｄａ'
+
+    @pytest.mark.asyncio
+    async def test_optional_fields_passed(self, mock_db):
+        """Optional fields should be passed to database."""
+        await store_alias(
+            alias='FDA',
+            canonical='US FDA',
+            method='llm',
+            confidence=0.95,
+            db=mock_db,
+            workspace='default',
+            llm_reasoning='FDA is the common abbreviation',
+            source_doc_id='doc123',
+            entity_type='Organization',
+        )
+
+        mock_db.execute.assert_called_once()
+        call_args = mock_db.execute.call_args
+        data = call_args.kwargs.get('data') or call_args.args[1]
+        assert data['llm_reasoning'] == 'FDA is the common abbreviation'
+        assert data['source_doc_id'] == 'doc123'
+        assert data['entity_type'] == 'Organization'
+
+    @pytest.mark.asyncio
+    async def test_database_error_handled_gracefully(self, mock_db):
+        """Database error should be logged but not raise."""
+        mock_db.execute = AsyncMock(side_effect=Exception('Insert failed'))
+
+        # Should not raise
+        await store_alias(
+            alias='FDA',
+            canonical='US FDA',
+            method='llm',
+            confidence=0.9,
+            db=mock_db,
+            workspace='default',
+        )
+
+    @pytest.mark.asyncio
+    async def test_timestamp_included(self, mock_db):
+        """create_time timestamp should be included."""
+        await store_alias(
+            alias='FDA',
+            canonical='US FDA',
+            method='llm',
+            confidence=0.9,
+            db=mock_db,
+            workspace='default',
+        )
+
+        call_args = mock_db.execute.call_args
+        data = call_args.kwargs.get('data') or call_args.args[1]
+        assert 'create_time' in data
+
+    @pytest.mark.asyncio
+    async def test_workspace_included(self, mock_db):
+        """Workspace should be included in stored data."""
+        await store_alias(
+            alias='FDA',
+            canonical='US FDA',
+            method='llm',
+            confidence=0.9,
+            db=mock_db,
+            workspace='custom_workspace',
+        )
+
+        call_args = mock_db.execute.call_args
+        data = call_args.kwargs.get('data') or call_args.args[1]
+        assert data['workspace'] == 'custom_workspace'
+
+
+# --- TestLLMReviewEntitiesBatch ---
+
+
+class TestLLMReviewEntitiesBatch:
+    """Tests for llm_review_entities_batch function."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_config_returns_empty(
+        self, mock_entity_vdb, mock_llm_fn, disabled_config
+    ):
+        """Disabled config should return empty result."""
+        result = await llm_review_entities_batch(
+            new_entities=['FDA', 'WHO'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            config=disabled_config,
+        )
+
+        assert result.reviewed_count == 0
+        assert result.match_count == 0
+        assert result.new_count == 0
+        assert result.results == []
+        mock_llm_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_entities_returns_empty(self, mock_entity_vdb, mock_llm_fn):
+        """Empty entity list should return empty result."""
+        result = await llm_review_entities_batch(
+            new_entities=[],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result.reviewed_count == 0
+        mock_llm_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_single_entity_match(self, mock_entity_vdb, mock_llm_fn):
+        """Single entity with match should be processed."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(
+            return_value=[{'entity_name': 'US Food and Drug Administration'}]
+        )
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US Food and Drug Administration',
+                    'confidence': 0.95,
+                    'reasoning': 'FDA is the abbreviation',
+                }
+            ]
+        )
+
+        result = await llm_review_entities_batch(
+            new_entities=['FDA'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result.reviewed_count == 1
+        assert result.match_count == 1
+        assert result.new_count == 0
+        assert result.results[0].canonical == 'US Food and Drug Administration'
+
+    @pytest.mark.asyncio
+    async def test_multiple_entities_mixed_results(self, mock_entity_vdb, mock_llm_fn):
+        """Multiple entities with mixed match/new results."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.9,
+                    'reasoning': 'Match',
+                },
+                {
+                    'new_entity': 'NewEntity',
+                    'matches_existing': False,
+                    'canonical': 'NewEntity',
+                    'confidence': 0.1,
+                    'reasoning': 'New',
+                },
+            ]
+        )
+
+        result = await llm_review_entities_batch(
+            new_entities=['FDA', 'NewEntity'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result.reviewed_count == 2
+        assert result.match_count == 1
+        assert result.new_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vdb_query_called(self, mock_entity_vdb, mock_llm_fn):
+        """VDB should be queried for each entity."""
+        mock_llm_fn.return_value = '[]'
+
+        await llm_review_entities_batch(
+            new_entities=['EntityA', 'EntityB'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        # hybrid_entity_search called for each entity + reverse lookups
+        assert mock_entity_vdb.hybrid_entity_search.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_vdb_query_when_no_hybrid(
+        self, mock_entity_vdb, mock_llm_fn
+    ):
+        """Should fall back to VDB query when hybrid_entity_search unavailable."""
+        del mock_entity_vdb.hybrid_entity_search  # Remove hybrid search
+        mock_entity_vdb.query = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = '[]'
+
+        result = await llm_review_entities_batch(
+            new_entities=['Test'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result is not None
+        mock_entity_vdb.query.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_confidence_threshold_applied(
+        self, mock_entity_vdb, mock_llm_fn, config_low_confidence
+    ):
+        """Matches below confidence threshold should be rejected."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        # Return match with high confidence (above 0.5 threshold)
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.6,  # Above 0.5 threshold
+                    'reasoning': 'Match',
+                }
+            ]
+        )
+
+        result = await llm_review_entities_batch(
+            new_entities=['FDA'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            config=config_low_confidence,
+        )
+
+        assert result.results[0].matches_existing is True
+
+    @pytest.mark.asyncio
+    async def test_confidence_below_threshold_rejected(self, mock_entity_vdb, mock_llm_fn):
+        """Matches below default confidence threshold (0.85) should be rejected."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.5,  # Below 0.85 threshold
+                    'reasoning': 'Weak match',
+                }
+            ]
+        )
+
+        result = await llm_review_entities_batch(
+            new_entities=['FDA'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            config=DEFAULT_CONFIG,
+        )
+
+        # Match should be rejected due to low confidence
+        assert result.results[0].matches_existing is False
+        assert result.results[0].canonical == 'FDA'  # Reset to original
+
+    @pytest.mark.asyncio
+    async def test_llm_error_fallback(self, mock_entity_vdb, mock_llm_fn):
+        """LLM error should fall back to treating all as new entities."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.side_effect = Exception('LLM API error')
+
+        result = await llm_review_entities_batch(
+            new_entities=['FDA', 'WHO'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result.reviewed_count == 2
+        assert result.match_count == 0
+        assert result.new_count == 2
+        for r in result.results:
+            assert r.matches_existing is False
+            assert 'LLM review failed' in r.reasoning
+
+    @pytest.mark.asyncio
+    async def test_missing_entities_in_response_handled(
+        self, mock_entity_vdb, mock_llm_fn
+    ):
+        """Entities not in LLM response should be added as new."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        # LLM only returns one of two entities
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': False,
+                    'canonical': 'FDA',
+                    'confidence': 0.5,
+                    'reasoning': 'Reviewed',
+                }
+            ]
+        )
+
+        result = await llm_review_entities_batch(
+            new_entities=['FDA', 'MissingEntity'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result.reviewed_count == 2
+        missing_result = [r for r in result.results if r.new_entity == 'MissingEntity']
+        assert len(missing_result) == 1
+        assert missing_result[0].reasoning == 'Not reviewed by LLM'
+
+    @pytest.mark.asyncio
+    async def test_entity_types_passed_to_prompt(self, mock_entity_vdb, mock_llm_fn):
+        """Entity types should be included in the prompt."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = '[]'
+
+        await llm_review_entities_batch(
+            new_entities=['Apple'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            entity_types={'Apple': 'Organization'},
+        )
+
+        # Check that LLM was called with entity type in prompt
+        call_args = mock_llm_fn.call_args
+        user_prompt = call_args.args[0]
+        assert 'Organization' in user_prompt
+
+    @pytest.mark.asyncio
+    async def test_no_vdb_all_new(self, mock_llm_fn):
+        """Without VDB, all entities should have no candidates."""
+        mock_llm_fn.return_value = json.dumps(
+            [{'new_entity': 'Test', 'matches_existing': False, 'canonical': 'Test'}]
+        )
+
+        result = await llm_review_entities_batch(
+            new_entities=['Test'],
+            entity_vdb=None,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result.reviewed_count == 1
+        # Check prompt mentions "none" for candidates
+        call_args = mock_llm_fn.call_args
+        user_prompt = call_args.args[0]
+        assert 'none' in user_prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_vdb_error_handled_gracefully(self, mock_entity_vdb, mock_llm_fn):
+        """VDB query errors should be handled gracefully."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(
+            side_effect=Exception('VDB error')
+        )
+        mock_llm_fn.return_value = '[]'
+
+        # Should not raise
+        result = await llm_review_entities_batch(
+            new_entities=['Test'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+        )
+
+        assert result is not None
+
+
+# --- TestLLMReviewEntityPairs ---
+
+
+class TestLLMReviewEntityPairs:
+    """Tests for llm_review_entity_pairs function."""
+
+    @pytest.mark.asyncio
+    async def test_empty_pairs_returns_empty(self, mock_llm_fn):
+        """Empty pairs list should return empty result."""
+        result = await llm_review_entity_pairs(pairs=[], llm_fn=mock_llm_fn)
+
+        assert result == []
+        mock_llm_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_same_entity_pair(self, mock_llm_fn):
+        """Pair of same entities should be identified as same."""
+        mock_llm_fn.return_value = json.dumps(
+            [{'pair_id': 1, 'same_entity': True, 'canonical': 'FDA', 'confidence': 0.99}]
+        )
+
+        result = await llm_review_entity_pairs(
+            pairs=[('FDA', 'US FDA')], llm_fn=mock_llm_fn
+        )
+
+        assert len(result) == 1
+        assert result[0]['same_entity'] is True
+
+    @pytest.mark.asyncio
+    async def test_different_entity_pair(self, mock_llm_fn):
+        """Pair of different entities should be identified as different."""
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'pair_id': 1,
+                    'same_entity': False,
+                    'confidence': 0.95,
+                    'reasoning': 'Different',
+                }
+            ]
+        )
+
+        result = await llm_review_entity_pairs(
+            pairs=[('Apple Inc', 'Apple Records')], llm_fn=mock_llm_fn
+        )
+
+        assert len(result) == 1
+        assert result[0]['same_entity'] is False
+
+    @pytest.mark.asyncio
+    async def test_multiple_pairs(self, mock_llm_fn):
+        """Multiple pairs should all be processed."""
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {'pair_id': 1, 'same_entity': True},
+                {'pair_id': 2, 'same_entity': False},
+                {'pair_id': 3, 'same_entity': True},
+            ]
+        )
+
+        result = await llm_review_entity_pairs(
+            pairs=[('A', 'B'), ('C', 'D'), ('E', 'F')], llm_fn=mock_llm_fn
+        )
+
+        assert len(result) == 3
+
+    @pytest.mark.asyncio
+    async def test_llm_error_returns_empty(self, mock_llm_fn):
+        """LLM error should return empty list."""
+        mock_llm_fn.side_effect = Exception('LLM error')
+
+        result = await llm_review_entity_pairs(
+            pairs=[('A', 'B')], llm_fn=mock_llm_fn
+        )
+
+        assert result == []
+
+
+# --- TestResolveEntity ---
+
+
+class TestResolveEntity:
+    """Tests for resolve_entity function."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_returns_new(
+        self, mock_entity_vdb, mock_llm_fn, mock_db, disabled_config
+    ):
+        """Disabled config should return 'new' immediately."""
+        result = await resolve_entity(
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+            config=disabled_config,
+        )
+
         assert result.action == 'new'
         assert result.method == 'disabled'
+        mock_db.query.assert_not_called()
+        mock_llm_fn.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_genuinely_new_entity(self, existing_entities, config):
-        """Completely new entity should return 'new'."""
-        result = await resolve_entity(
-            'CompletelyNewDrug',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
+    async def test_cache_hit_returns_cached(self, mock_entity_vdb, mock_llm_fn, mock_db):
+        """Cache hit should return cached result without LLM call."""
+        mock_db.query = AsyncMock(
+            return_value={
+                'canonical_entity': 'US FDA',
+                'method': 'llm',
+                'confidence': 0.95,
+            }
         )
-        assert result.action == 'new'
-        assert result.method == 'none'
 
-
-class TestResolutionResult:
-    """Tests for ResolutionResult dataclass."""
-
-    @pytest.mark.asyncio
-    async def test_result_has_all_fields(self, existing_entities, config):
-        """ResolutionResult should have action, matched_entity, confidence, method."""
         result = await resolve_entity(
-            'Dupixent',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
         )
-        assert hasattr(result, 'action')
-        assert hasattr(result, 'matched_entity')
-        assert hasattr(result, 'confidence')
-        assert hasattr(result, 'method')
 
-    @pytest.mark.asyncio
-    async def test_confidence_range(self, existing_entities, config):
-        """Confidence should be between 0 and 1."""
-        result = await resolve_entity(
-            'Dupixent',
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        assert 0.0 <= result.confidence <= 1.0
-
-
-class TestConfigOptions:
-    """Tests for EntityResolutionConfig behavior."""
-
-    @pytest.mark.asyncio
-    async def test_fuzzy_threshold_affects_matching(self, existing_entities):
-        """Higher fuzzy threshold should reject more matches."""
-        # Very high threshold - should not fuzzy match
-        config_strict = EntityResolutionConfig(fuzzy_threshold=0.99)
-        result = await resolve_entity(
-            'Dupixant',  # typo
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config_strict,
-        )
-        # Should not match via fuzzy (88% < 99%)
-        assert result.method != 'fuzzy'
-
-    @pytest.mark.asyncio
-    async def test_fuzzy_pre_resolution_disabled_still_fuzzy_matches(self, existing_entities):
-        """Disabling fuzzy_pre_resolution doesn't disable fuzzy matching entirely.
-
-        fuzzy_pre_resolution_enabled controls pre-filtering before LLM,
-        not the fuzzy matching layer itself.
-        """
-        config = EntityResolutionConfig(fuzzy_pre_resolution_enabled=False)
-        result = await resolve_entity(
-            'Dupixant',  # typo, 88% fuzzy match to Dupixent
-            existing_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        # Fuzzy matching layer (Layer 2) still works
         assert result.action == 'match'
-        assert result.matched_entity == 'Dupixent'
+        assert result.matched_entity == 'US FDA'
+        assert result.method == 'cached'
+        mock_llm_fn.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_max_candidates_limits_search(self, config):
-        """max_candidates should limit number of candidates considered."""
-        # Create many existing entities
-        many_entities = [(f'Entity{i}', [float(i), 0.0, 0.0, 0.0, 0.0]) for i in range(100)]
-        config.max_candidates = 3
+    async def test_cache_miss_calls_llm(self, mock_entity_vdb, mock_llm_fn, mock_db):
+        """Cache miss should call LLM for resolution."""
+        mock_db.query = AsyncMock(return_value=None)  # Cache miss
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.9,
+                    'reasoning': 'Match',
+                }
+            ]
+        )
 
         result = await resolve_entity(
-            'SomeEntity',
-            many_entities,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-        # Should complete without error
-        assert result.action in ('match', 'new')
-
-
-class TestLayerOrder:
-    """Tests verifying the correct layer execution order."""
-
-    @pytest.mark.asyncio
-    async def test_exact_match_short_circuits(self, existing_entities, config):
-        """Exact match should return immediately without calling LLM."""
-        # Track if LLM was called
-        llm_called = [False]
-
-        async def tracking_llm(prompt: str) -> str:
-            llm_called[0] = True
-            return 'YES'
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing_entities,
-            mock_embed_fn,
-            tracking_llm,
-            config,
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
         )
 
-        assert result.method == 'exact'
-        assert not llm_called[0]  # LLM should not be called
-
-    @pytest.mark.asyncio
-    async def test_abbreviation_before_fuzzy(self, config):
-        """Abbreviation detection should run before fuzzy matching."""
-        existing = [
-            ('World Health Organization', [0.1, 0.2, 0.3, 0.4, 0.5]),
-        ]
-        result = await resolve_entity(
-            'WHO',
-            existing,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-
-        assert result.method == 'abbreviation'
-        assert result.matched_entity == 'World Health Organization'
-
-    @pytest.mark.asyncio
-    async def test_fuzzy_before_llm(self, config):
-        """Fuzzy matching should run before LLM for close matches."""
-        existing = [
-            ('Dupixent', MOCK_EMBEDDINGS['dupixent']),
-        ]
-
-        llm_called = [False]
-
-        async def tracking_llm(prompt: str) -> str:
-            llm_called[0] = True
-            return 'YES'
-
-        result = await resolve_entity(
-            'Dupixant',  # typo, 88% match
-            existing,
-            mock_embed_fn,
-            tracking_llm,
-            config,
-        )
-
-        assert result.method == 'fuzzy'
-        assert not llm_called[0]  # LLM should not be called for fuzzy match
-
-
-# --- LLM Response Parsing Tests ---
-
-
-class TestLLMResponseParsing:
-    """Tests for LLM response parsing edge cases.
-
-    These tests verify that llm_verify handles malformed and unexpected
-    responses gracefully without false positives.
-    """
-
-    @pytest.mark.asyncio
-    async def test_empty_response_returns_false(self, existing_entities, config):
-        """Empty LLM response should be treated as NO (default to safe)."""
-
-        async def empty_llm(prompt: str) -> str:
-            return ''
-
-        # Configure to reach LLM verification
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,  # Prevent fuzzy match
-            abbreviation_detection_enabled=False,
-        )
-
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            empty_llm,
-            config,
-        )
-
-        # Empty response should default to NO (no match)
-        assert result.action == 'new'
-        assert result.method == 'none'
-
-    @pytest.mark.asyncio
-    async def test_whitespace_only_response_returns_false(self, config):
-        """Whitespace-only response should be treated as NO."""
-
-        async def whitespace_llm(prompt: str) -> str:
-            return '   \n\t  \n  '
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
-        )
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            whitespace_llm,
-            config,
-        )
-
-        assert result.action == 'new'
-
-    @pytest.mark.asyncio
-    async def test_multiline_response_takes_first_line(self, config):
-        """Multi-line response should use first line only."""
-
-        async def multiline_llm(prompt: str) -> str:
-            return 'YES\nBut actually I changed my mind NO\nDefinitely NO'
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
-        )
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            multiline_llm,
-            config,
-        )
-
-        # Should take "YES" from first line
         assert result.action == 'match'
+        assert result.matched_entity == 'US FDA'
         assert result.method == 'llm'
+        mock_llm_fn.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_response_with_trailing_punctuation(self, config):
-        """Response with trailing punctuation should be handled."""
-
-        async def punctuated_llm(prompt: str) -> str:
-            return 'YES.'
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
+    async def test_llm_no_match_returns_new(self, mock_entity_vdb, mock_llm_fn, mock_db):
+        """LLM no-match should return 'new'."""
+        mock_db.query = AsyncMock(return_value=None)
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'NewEntity',
+                    'matches_existing': False,
+                    'canonical': 'NewEntity',
+                    'confidence': 0.1,
+                    'reasoning': 'No match',
+                }
+            ]
         )
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
 
         result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            punctuated_llm,
-            config,
+            entity_name='NewEntity',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
         )
 
-        assert result.action == 'match'
-        assert result.method == 'llm'
-
-    @pytest.mark.asyncio
-    async def test_lowercase_yes_normalized(self, config):
-        """Lowercase 'yes' should be normalized to YES."""
-
-        async def lowercase_llm(prompt: str) -> str:
-            return 'yes'
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
-        )
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            lowercase_llm,
-            config,
-        )
-
-        assert result.action == 'match'
-        assert result.method == 'llm'
-
-    @pytest.mark.asyncio
-    async def test_ambiguous_response_defaults_to_no(self, config):
-        """Ambiguous response should default to NO (safer)."""
-
-        async def ambiguous_llm(prompt: str) -> str:
-            return 'Maybe, it depends on the context'
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
-        )
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            ambiguous_llm,
-            config,
-        )
-
-        # Ambiguous should default to NO (new entity)
         assert result.action == 'new'
-
-    @pytest.mark.asyncio
-    async def test_partial_match_not_accepted(self, config):
-        """Partial token match should not be accepted (e.g., 'YESSIR')."""
-
-        async def partial_llm(prompt: str) -> str:
-            return 'YESSIR'
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
-        )
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            partial_llm,
-            config,
-        )
-
-        # "YESSIR" contains "YES" but is not exact token match
-        assert result.action == 'new'
-
-    @pytest.mark.asyncio
-    async def test_valid_alternative_tokens(self, config):
-        """Test all valid positive tokens: TRUE, SAME, MATCH."""
-        valid_positive_tokens = ['TRUE', 'SAME', 'MATCH']
-
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        for token in valid_positive_tokens:
-
-            async def token_llm(prompt: str, t=token) -> str:
-                return t
-
-            config = EntityResolutionConfig(
-                fuzzy_threshold=0.99,
-                abbreviation_detection_enabled=False,
-            )
-
-            result = await resolve_entity(
-                'Dupixent',
-                existing,
-                mock_embed_fn,
-                token_llm,
-                config,
-            )
-
-            assert result.action == 'match', f"Token '{token}' should be accepted"
-            assert result.method == 'llm'
-
-
-# --- VDB Error Recovery Tests ---
-
-
-class TestVDBErrorRecovery:
-    """Tests for VDB failure handling and recovery.
-
-    These tests verify that VDB errors are handled gracefully without
-    crashing or producing incorrect results.
-    """
-
-    @pytest.mark.asyncio
-    async def test_vdb_returns_malformed_candidates_handled(self, config):
-        """VDB returning candidates with unexpected structure is handled gracefully.
-
-        The code defensively handles malformed candidates (strings instead of dicts)
-        by skipping them and returning 'new' if no valid candidates remain.
-        """
-        from unittest.mock import AsyncMock, MagicMock
-
-        from lightrag.entity_resolution.resolver import resolve_entity_with_vdb
-
-        mock_vdb = MagicMock()
-        # Return malformed data - list of strings instead of dicts
-        mock_vdb.query = AsyncMock(return_value=['string1', 'string2'])
-
-        async def no_llm(prompt: str) -> str:
-            return 'NO'
-
-        # Should handle gracefully and return new (no valid candidates)
-        result = await resolve_entity_with_vdb('Entity', mock_vdb, no_llm, config)
-        assert result.action == 'new'
+        assert result.matched_entity is None
         assert result.method == 'none'
 
     @pytest.mark.asyncio
-    async def test_vdb_mixed_valid_invalid_candidates(self, config):
-        """VDB with mix of valid dicts and invalid items processes valid ones."""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from lightrag.entity_resolution.resolver import resolve_entity_with_vdb
-
-        mock_vdb = MagicMock()
-        # Mix of valid and invalid candidates
-        mock_vdb.query = AsyncMock(return_value=[
-            'string_garbage',  # Invalid: string
-            {'entity_name': 'Dupixent'},  # Valid
-            42,  # Invalid: number
-            {'other_field': 'no_name'},  # Invalid: missing entity_name
-            None,  # Invalid: None
-        ])
-
-        async def no_llm(prompt: str) -> str:
-            return 'NO'
-
-        # Should find the valid candidate via exact match
-        result = await resolve_entity_with_vdb('dupixent', mock_vdb, no_llm, config)
-        assert result.action == 'match'
-        assert result.matched_entity == 'Dupixent'
-        assert result.method == 'exact'
-
-    @pytest.mark.asyncio
-    async def test_vdb_returns_none_candidates(self, config):
-        """VDB returning None instead of empty list."""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from lightrag.entity_resolution.resolver import resolve_entity_with_vdb
-
-        mock_vdb = MagicMock()
-        mock_vdb.query = AsyncMock(return_value=None)
-
-        async def no_llm(prompt: str) -> str:
-            return 'NO'
-
-        result = await resolve_entity_with_vdb('Entity', mock_vdb, no_llm, config)
-
-        assert result.action == 'new'
-        assert result.method == 'none'
-
-    @pytest.mark.asyncio
-    async def test_vdb_timeout_handled(self, config):
-        """VDB timeout should be handled gracefully."""
-        import asyncio
-        from unittest.mock import MagicMock
-
-        from lightrag.entity_resolution.resolver import resolve_entity_with_vdb
-
-        mock_vdb = MagicMock()
-
-        async def timeout_query(*args, **kwargs):
-            raise asyncio.TimeoutError('VDB query timed out')
-
-        mock_vdb.query = timeout_query
-
-        async def no_llm(prompt: str) -> str:
-            return 'NO'
-
-        result = await resolve_entity_with_vdb('Entity', mock_vdb, no_llm, config)
-
-        assert result.action == 'new'
-        assert result.method == 'none'
-
-
-# --- Large Batch Processing Tests ---
-
-
-class TestLargeBatchProcessing:
-    """Tests for handling large numbers of entities and candidates.
-
-    These tests verify that the resolution system handles scale gracefully.
-    """
-
-    @pytest.mark.asyncio
-    async def test_many_existing_entities(self, config):
-        """Should handle resolution against many existing entities."""
-        # Create 100 existing entities
-        existing = [(f'Entity_{i}', [float(i % 10) / 10, 0.0, 0.0, 0.0, 0.0]) for i in range(100)]
-
-        result = await resolve_entity(
-            'Entity_50',  # Exact match
-            existing,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-
-        assert result.action == 'match'
-        assert result.matched_entity == 'Entity_50'
-        assert result.method == 'exact'
-
-    @pytest.mark.asyncio
-    async def test_no_match_among_many(self, config):
-        """Should correctly return new when no match among many entities."""
-        # Create 50 entities, none matching
-        existing = [(f'Other_{i}', [float(i % 10) / 10, 0.0, 0.0, 0.0, 0.0]) for i in range(50)]
-
-        result = await resolve_entity(
-            'CompletelyUnique',
-            existing,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
-        )
-
-        assert result.action == 'new'
-        assert result.method == 'none'
-
-    @pytest.mark.asyncio
-    async def test_max_candidates_limits_llm_calls(self, config):
-        """max_candidates should limit LLM verification calls."""
-        # Create many candidates that would need LLM verification
-        existing = [(f'Similar_{i}', [0.5, 0.5, 0.5, 0.5, 0.5]) for i in range(20)]
-
-        llm_call_count = [0]
-
-        async def counting_llm(prompt: str) -> str:
-            llm_call_count[0] += 1
-            return 'NO'  # Never match
-
-        config = EntityResolutionConfig(
-            max_candidates=3,
-            fuzzy_threshold=0.99,  # Prevent fuzzy match
-            abbreviation_detection_enabled=False,
+    async def test_auto_apply_stores_alias(self, mock_entity_vdb, mock_llm_fn, mock_db):
+        """With auto_apply, matches should be stored in cache."""
+        mock_db.query = AsyncMock(return_value=None)  # Cache miss
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.95,
+                    'reasoning': 'Match',
+                }
+            ]
         )
 
         await resolve_entity(
-            'Query',
-            existing,
-            mock_embed_fn,
-            counting_llm,
-            config,
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+            config=DEFAULT_CONFIG,
         )
 
-        # Should only call LLM max_candidates times
-        assert llm_call_count[0] <= config.max_candidates
+        # Verify store was called
+        mock_db.execute.assert_called()
 
     @pytest.mark.asyncio
-    async def test_fuzzy_finds_best_among_many(self, config):
-        """Fuzzy matching should find the best match among many similar entities."""
-        # Create entities with varying similarity to "Dupixent"
-        existing = [
-            ('Dupixant', [0.0] * 5),  # 88% similar - typo
-            ('Dupixont', [0.0] * 5),  # 75% similar
-            ('Duplexent', [0.0] * 5),  # 75% similar
-            ('Different', [0.0] * 5),  # Low similarity
-        ]
+    async def test_no_auto_apply_skips_storage(
+        self, mock_entity_vdb, mock_llm_fn, mock_db, config_no_auto_apply
+    ):
+        """Without auto_apply, matches should not be stored."""
+        mock_db.query = AsyncMock(return_value=None)
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.95,
+                    'reasoning': 'Match',
+                }
+            ]
+        )
+
+        await resolve_entity(
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+            config=config_no_auto_apply,
+        )
+
+        # Verify store was NOT called
+        mock_db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_db_still_works(self, mock_entity_vdb, mock_llm_fn):
+        """Resolution should work without database (no caching)."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.9,
+                    'reasoning': 'Match',
+                }
+            ]
+        )
 
         result = await resolve_entity(
-            'Dupixent',
-            existing,
-            mock_embed_fn,
-            mock_llm_fn,
-            config,
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=None,  # No database
         )
 
         assert result.action == 'match'
-        assert result.matched_entity == 'Dupixant'  # Best fuzzy match
-        assert result.method == 'fuzzy'
+        assert result.matched_entity == 'US FDA'
 
     @pytest.mark.asyncio
-    async def test_vdb_with_many_candidates(self, config):
-        """VDB resolution should handle many candidates efficiently."""
-        from unittest.mock import AsyncMock, MagicMock
+    async def test_empty_llm_response_returns_none(
+        self, mock_entity_vdb, mock_llm_fn, mock_db
+    ):
+        """Empty LLM response should return 'new' with 'none' method."""
+        mock_db.query = AsyncMock(return_value=None)
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = '[]'
 
-        from lightrag.entity_resolution.resolver import resolve_entity_with_vdb
+        result = await resolve_entity(
+            entity_name='Test',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+        )
 
-        mock_vdb = MagicMock()
-        # Return 50 candidates
-        mock_vdb.query = AsyncMock(return_value=[
-            {'entity_name': f'Candidate_{i}'} for i in range(50)
-        ])
+        assert result.action == 'new'
+        assert result.method == 'none'
 
-        async def no_llm(prompt: str) -> str:
-            return 'NO'
+    @pytest.mark.asyncio
+    async def test_source_doc_id_passed_to_store(
+        self, mock_entity_vdb, mock_llm_fn, mock_db
+    ):
+        """source_doc_id should be passed when storing alias."""
+        mock_db.query = AsyncMock(return_value=None)
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.95,
+                    'reasoning': 'Match',
+                }
+            ]
+        )
 
-        result = await resolve_entity_with_vdb('candidate_25', mock_vdb, no_llm, config)
+        await resolve_entity(
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+            source_doc_id='doc123',
+        )
 
-        # Should find exact match (case-insensitive)
+        call_args = mock_db.execute.call_args
+        data = call_args.kwargs.get('data') or call_args.args[1]
+        assert data['source_doc_id'] == 'doc123'
+
+    @pytest.mark.asyncio
+    async def test_entity_type_passed_to_store(
+        self, mock_entity_vdb, mock_llm_fn, mock_db
+    ):
+        """entity_type should be passed when storing alias."""
+        mock_db.query = AsyncMock(return_value=None)
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(return_value=[])
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.95,
+                    'reasoning': 'Match',
+                }
+            ]
+        )
+
+        await resolve_entity(
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+            entity_type='Organization',
+        )
+
+        call_args = mock_db.execute.call_args
+        data = call_args.kwargs.get('data') or call_args.args[1]
+        assert data['entity_type'] == 'Organization'
+
+
+# --- TestEdgeCases ---
+
+
+class TestEdgeCases:
+    """Edge case and security tests."""
+
+    def test_unicode_entity_names(self):
+        """Unicode entity names should parse correctly."""
+        response = '[{"new_entity": "北京大学", "canonical": "Peking University"}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['new_entity'] == '北京大学'
+
+    def test_very_long_entity_names(self):
+        """Very long entity names should be handled."""
+        long_name = 'A' * 1000
+        response = f'[{{"new_entity": "{long_name}", "canonical": "{long_name}"}}]'
+        result = _parse_llm_json_response(response)
+        assert len(result[0]['new_entity']) == 1000
+
+    def test_empty_entity_name(self):
+        """Empty entity names should be handled."""
+        response = '[{"new_entity": "", "canonical": "Something"}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['new_entity'] == ''
+
+    def test_whitespace_only_entity(self):
+        """Whitespace-only entities should be handled."""
+        response = '[{"new_entity": "   ", "canonical": "Something"}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['new_entity'] == '   '
+
+    def test_special_characters_preserved(self):
+        """Special characters should be preserved."""
+        response = '[{"new_entity": "AT&T", "canonical": "AT&T Inc."}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['new_entity'] == 'AT&T'
+
+    def test_newlines_in_entity(self):
+        """Newlines in entity names should be handled."""
+        response = '[{"new_entity": "Line1\\nLine2", "canonical": "Test"}]'
+        result = _parse_llm_json_response(response)
+        assert '\n' in result[0]['new_entity']
+
+    def test_quotes_in_entity(self):
+        """Escaped quotes in entity names should be handled."""
+        response = '[{"new_entity": "The \\"Company\\"", "canonical": "Company"}]'
+        result = _parse_llm_json_response(response)
+        assert '"' in result[0]['new_entity']
+
+    def test_sql_injection_attempt_in_entity(self):
+        """SQL injection attempts should be safely parsed as data."""
+        response = '[{"new_entity": "entity\'; DROP TABLE aliases;--", "canonical": "Safe"}]'
+        result = _parse_llm_json_response(response)
+        # The malicious content is just data, not executed
+        assert "DROP TABLE" in result[0]['new_entity']
+
+    def test_boundary_confidence_zero(self):
+        """Zero confidence should be handled."""
+        response = '[{"new_entity": "Test", "confidence": 0}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['confidence'] == 0
+
+    def test_boundary_confidence_one(self):
+        """Confidence of 1.0 should be handled."""
+        response = '[{"new_entity": "Test", "confidence": 1.0}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['confidence'] == 1.0
+
+    def test_confidence_above_one_handled(self):
+        """Confidence above 1.0 (invalid) should be parsed as-is."""
+        response = '[{"new_entity": "Test", "confidence": 1.5}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['confidence'] == 1.5
+
+    def test_negative_confidence_handled(self):
+        """Negative confidence (invalid) should be parsed as-is."""
+        response = '[{"new_entity": "Test", "confidence": -0.5}]'
+        result = _parse_llm_json_response(response)
+        assert result[0]['confidence'] == -0.5
+
+
+# --- Integration-like Tests (still using mocks) ---
+
+
+class TestResolutionFlow:
+    """Tests for complete resolution flow scenarios."""
+
+    @pytest.mark.asyncio
+    async def test_full_resolution_with_cache_and_llm(
+        self, mock_entity_vdb, mock_llm_fn, mock_db
+    ):
+        """Test complete flow: cache miss -> VDB search -> LLM -> cache store."""
+        # Setup: Cache miss, VDB returns candidates, LLM finds match
+        mock_db.query = AsyncMock(return_value=None)
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(
+            return_value=[
+                {'entity_name': 'US Food and Drug Administration'},
+                {'entity_name': 'FDA Agency'},
+            ]
+        )
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US Food and Drug Administration',
+                    'confidence': 0.95,
+                    'reasoning': 'FDA is a common abbreviation',
+                }
+            ]
+        )
+
+        result = await resolve_entity(
+            entity_name='FDA',
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            db=mock_db,
+            workspace='test_workspace',
+            source_doc_id='doc_001',
+            entity_type='Organization',
+        )
+
+        # Verify flow
         assert result.action == 'match'
-        assert result.matched_entity == 'Candidate_25'
-        assert result.method == 'exact'
+        assert result.matched_entity == 'US Food and Drug Administration'
+        assert result.confidence == 0.95
+        assert result.method == 'llm'
 
+        # Verify cache was checked first
+        assert mock_db.query.called
 
-# --- LLM Error Handling Tests ---
+        # Verify VDB was searched
+        assert mock_entity_vdb.hybrid_entity_search.called
 
+        # Verify LLM was called
+        assert mock_llm_fn.called
 
-class TestLLMErrorHandling:
-    """Tests for LLM function error handling.
-
-    These tests verify that LLM errors don't crash the resolution system.
-    """
-
-    @pytest.mark.asyncio
-    async def test_llm_raises_exception(self, config):
-        """LLM raising an exception should be handled gracefully."""
-
-        async def error_llm(prompt: str) -> str:
-            raise RuntimeError('LLM service unavailable')
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,  # Force LLM path
-            abbreviation_detection_enabled=False,
-        )
-
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        # The current implementation doesn't catch LLM errors,
-        # so this documents expected behavior
-        with pytest.raises(RuntimeError):
-            await resolve_entity(
-                'Dupixent',
-                existing,
-                mock_embed_fn,
-                error_llm,
-                config,
-            )
+        # Verify alias was stored
+        assert mock_db.execute.called
 
     @pytest.mark.asyncio
-    async def test_llm_returns_none(self, config):
-        """LLM returning None should be handled."""
-
-        async def none_llm(prompt: str) -> str:
-            return None  # type: ignore
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
+    async def test_batch_review_with_multiple_matches(
+        self, mock_entity_vdb, mock_llm_fn
+    ):
+        """Test batch review with multiple entities and various outcomes."""
+        mock_entity_vdb.hybrid_entity_search = AsyncMock(
+            side_effect=[
+                [{'entity_name': 'US FDA'}],  # For FDA
+                [{'entity_name': 'World Health Organization'}],  # For WHO
+                [],  # For NewCorp (no candidates)
+            ]
+        )
+        mock_llm_fn.return_value = json.dumps(
+            [
+                {
+                    'new_entity': 'FDA',
+                    'matches_existing': True,
+                    'canonical': 'US FDA',
+                    'confidence': 0.95,
+                    'reasoning': 'Abbreviation match',
+                },
+                {
+                    'new_entity': 'WHO',
+                    'matches_existing': True,
+                    'canonical': 'World Health Organization',
+                    'confidence': 0.92,
+                    'reasoning': 'Abbreviation match',
+                },
+                {
+                    'new_entity': 'NewCorp',
+                    'matches_existing': False,
+                    'canonical': 'NewCorp',
+                    'confidence': 0.1,
+                    'reasoning': 'No existing match found',
+                },
+            ]
         )
 
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
-
-        # None should be treated as non-match (can't strip None)
-        with pytest.raises(AttributeError):
-            await resolve_entity(
-                'Dupixent',
-                existing,
-                mock_embed_fn,
-                none_llm,
-                config,
-            )
-
-    @pytest.mark.asyncio
-    async def test_embed_fn_raises_exception(self, config):
-        """Embedding function raising an exception propagates up."""
-
-        async def error_embed(text: str) -> list[float]:
-            raise ConnectionError('Embedding service down')
-
-        config = EntityResolutionConfig(
-            fuzzy_threshold=0.99,
-            abbreviation_detection_enabled=False,
+        result = await llm_review_entities_batch(
+            new_entities=['FDA', 'WHO', 'NewCorp'],
+            entity_vdb=mock_entity_vdb,
+            llm_fn=mock_llm_fn,
+            entity_types={'FDA': 'Organization', 'WHO': 'Organization', 'NewCorp': 'Company'},
         )
 
-        existing = [('dupilumab', MOCK_EMBEDDINGS['dupilumab'])]
+        assert result.reviewed_count == 3
+        assert result.match_count == 2
+        assert result.new_count == 1
 
-        # Embed errors propagate (called for vector similarity layer)
-        with pytest.raises(ConnectionError):
-            await resolve_entity(
-                'Dupixent',
-                existing,
-                error_embed,
-                mock_llm_fn,
-                config,
-            )
+        fda_result = next(r for r in result.results if r.new_entity == 'FDA')
+        assert fda_result.matches_existing is True
+        assert fda_result.canonical == 'US FDA'
+
+        new_result = next(r for r in result.results if r.new_entity == 'NewCorp')
+        assert new_result.matches_existing is False
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

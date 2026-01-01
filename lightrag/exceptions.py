@@ -103,3 +103,12 @@ class PipelineCancelledException(Exception):
         self.message = message
 
 
+class LockTimeoutError(TimeoutError):
+    """Raised when lock acquisition times out."""
+
+    def __init__(self, key: str, timeout: float):
+        super().__init__(f'Failed to acquire lock for "{key}" within {timeout}s')
+        self.key = key
+        self.timeout = timeout
+
+

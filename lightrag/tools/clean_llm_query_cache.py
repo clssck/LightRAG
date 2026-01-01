@@ -157,7 +157,7 @@ class CleanupTool:
                 )
 
             return False
-        except Exception:
+        except (OSError, KeyError, configparser.Error):
             return False
 
     def check_env_vars(self, storage_name: str) -> bool:
@@ -718,8 +718,8 @@ class CleanupTool:
                 from lightrag.kg.shared_storage import finalize_share_data
 
                 finalize_share_data()
-            except Exception:
-                pass
+            except (KeyError, TypeError, AttributeError, OSError):
+                pass  # Ignore multiprocess cleanup errors during shutdown
 
 
 async def async_main():

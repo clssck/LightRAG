@@ -29,7 +29,8 @@ async def _persist_graph_updates(
         entity_chunks_storage: Entity-chunk tracking storage (optional)
         relation_chunks_storage: Relation-chunk tracking storage (optional)
     """
-    storages = []
+    # All storage types implement StorageNameSpace protocol
+    storages: list[Any] = []
 
     # Collect all non-None storage instances
     if entities_vdb is not None:
@@ -48,7 +49,7 @@ async def _persist_graph_updates(
         await asyncio.gather(
             *[
                 cast(StorageNameSpace, storage_inst).index_done_callback()
-                for storage_inst in storages  # type: ignore
+                for storage_inst in storages
             ]
         )
 
@@ -1218,11 +1219,16 @@ async def _merge_entities_impl(
                 'data': edge_data.copy(),
             }
 
-    # Apply relationship updates
+    # Apply relationship updates in parallel
     logger.info(f'Entity Merge: updating {len(relation_updates)} relations')
-    for rel_data in relation_updates.values():
-        await chunk_entity_relation_graph.upsert_edge(rel_data['graph_src'], rel_data['graph_tgt'], rel_data['data'])
+
+    async def _update_relation(rel_data: dict) -> None:
+        await chunk_entity_relation_graph.upsert_edge(
+            rel_data['graph_src'], rel_data['graph_tgt'], rel_data['data']
+        )
         logger.info(f'Entity Merge: updating relation `{rel_data["graph_src"]}`~`{rel_data["graph_tgt"]}`')
+
+    await asyncio.gather(*[_update_relation(rd) for rd in relation_updates.values()])
 
     # Update relation chunk tracking storage
     if relation_chunks_storage is not None and all_relations:
@@ -1343,20 +1349,19 @@ async def _merge_entities_impl(
             )
             logger.info(f"Entity Merge: find {len(merged_chunk_ids)} chunks related to '{target_entity}'")
 
-    # 10. Delete source entities
-    for entity_name in source_entities:
-        if entity_name == target_entity:
-            logger.warning(f"Entity Merge: source entity'{entity_name}' is same as target entity")
-            continue
+    # 10. Delete source entities in parallel
+    entities_to_delete = [e for e in source_entities if e != target_entity]
 
+    async def _delete_entity(entity_name: str) -> None:
         logger.info(f"Entity Merge: deleting '{entity_name}' from KG and vdb")
-
         # Delete entity node and related edges from knowledge graph
         await chunk_entity_relation_graph.delete_node(entity_name)
-
         # Delete entity record from vector database
         entity_id = compute_mdhash_id(entity_name, prefix='ent-')
         await entities_vdb.delete([entity_id])
+
+    if entities_to_delete:
+        await asyncio.gather(*[_delete_entity(e) for e in entities_to_delete])
 
     # 11. Save changes
     await _persist_graph_updates(

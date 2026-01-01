@@ -100,6 +100,10 @@ DEFAULT_MAX_PARALLEL_INSERT = 2  # Default maximum parallel insert operations
 # Embedding configuration defaults
 DEFAULT_EMBEDDING_FUNC_MAX_ASYNC = 8  # Default max async for embedding functions
 DEFAULT_EMBEDDING_BATCH_NUM = 10  # Default batch size for embedding computations
+DEFAULT_EMBEDDING_SIMILARITY_THRESHOLD = 0.95  # Minimum similarity score to use cached embeddings
+
+# Migration and batch processing defaults
+DEFAULT_MIGRATION_BATCH_SIZE = 500  # Batch size for chunk tracking migration
 
 # Gunicorn worker timeout
 DEFAULT_TIMEOUT = 300
@@ -128,3 +132,55 @@ DEFAULT_FTS_CACHE_ENABLED = True
 DEFAULT_METRICS_ENABLED = True
 DEFAULT_METRICS_HISTORY_SIZE = 1000  # Queries to keep in circular buffer
 DEFAULT_METRICS_WINDOW_SECONDS = 3600  # 1 hour window for percentile calculations
+
+# =============================================================================
+# Status Constants
+# =============================================================================
+# Document processing status values (used in doc_status storage)
+STATUS_PENDING = 'pending'
+STATUS_PROCESSING = 'processing'
+STATUS_COMPLETED = 'completed'
+STATUS_FAILED = 'failed'
+
+# Pipeline/job status values
+STATUS_SUCCESS = 'success'
+STATUS_FAILURE = 'failure'
+STATUS_CANCELLED = 'cancelled'
+
+# Background job state keys
+STATE_BUSY = 'busy'
+STATE_CANCELLATION_REQUESTED = 'cancellation_requested'
+STATE_REQUEST_PENDING = 'request_pending'
+
+# =============================================================================
+# Shared Storage Namespace Keys
+# =============================================================================
+# These keys are used with get_namespace_data/get_namespace_lock for cross-process state
+NS_PIPELINE_STATUS = 'pipeline_status'
+NS_ORPHAN_CONNECTION_STATUS = 'orphan_connection_status'
+NS_ENTITY_RESOLUTION_STATUS = 'entity_resolution_status'
+
+# =============================================================================
+# Common Field Names (for dict keys used across modules)
+# =============================================================================
+# Entity/relation fields
+FIELD_DESCRIPTION = 'description'
+FIELD_SOURCE_ID = 'source_id'
+FIELD_ENTITY_NAME = 'entity_name'
+FIELD_ENTITY_TYPE = 'entity_type'
+FIELD_FILE_PATH = 'file_path'
+FIELD_CONTENT = 'content'
+FIELD_KEYWORDS = 'keywords'
+FIELD_WEIGHT = 'weight'
+
+# Graph edge fields
+FIELD_SRC_ID = 'src_id'
+FIELD_TGT_ID = 'tgt_id'
+
+# Status/progress fields
+FIELD_STATUS = 'status'
+FIELD_LATEST_MESSAGE = 'latest_message'
+FIELD_HISTORY_MESSAGES = 'history_messages'
+
+# Default workspace name
+DEFAULT_WORKSPACE = 'default'

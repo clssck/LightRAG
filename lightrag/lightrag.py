@@ -36,6 +36,7 @@ from lightrag.base import (
 from lightrag.constants import (
     DEFAULT_CHUNK_TOP_K,
     DEFAULT_COSINE_THRESHOLD,
+    DEFAULT_EMBEDDING_SIMILARITY_THRESHOLD,
     DEFAULT_EMBEDDING_TIMEOUT,
     DEFAULT_ENTITY_TYPES,
     DEFAULT_FILE_PATH_MORE_PLACEHOLDER,
@@ -52,6 +53,7 @@ from lightrag.constants import (
     DEFAULT_MAX_SOURCE_IDS_PER_ENTITY,
     DEFAULT_MAX_SOURCE_IDS_PER_RELATION,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_MIGRATION_BATCH_SIZE,
     DEFAULT_MIN_RERANK_SCORE,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_SOURCE_IDS_LIMIT_METHOD,
@@ -61,6 +63,8 @@ from lightrag.constants import (
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_TOP_K,
     GRAPH_FIELD_SEP,
+    NS_ORPHAN_CONNECTION_STATUS,
+    NS_PIPELINE_STATUS,
 )
 from lightrag.entity_resolution import EntityResolutionConfig
 from lightrag.exceptions import PipelineCancelledException
@@ -90,7 +94,6 @@ from lightrag.utils import (
     EmbeddingFunc,
     TiktokenTokenizer,
     Tokenizer,
-    always_get_an_event_loop,
     check_storage_env_vars,
     compute_mdhash_id,
     convert_to_user_format,
@@ -104,6 +107,7 @@ from lightrag.utils import (
     priority_limit_async_func_call,
     sanitize_text_for_encoding,
     subtract_source_ids,
+    sync_wrapper,
 )
 
 # Public API exports (for re-export via __init__.py)
@@ -301,7 +305,7 @@ class LightRAG:
     embedding_cache_config: dict[str, Any] = field(
         default_factory=lambda: {
             'enabled': False,
-            'similarity_threshold': 0.95,
+            'similarity_threshold': DEFAULT_EMBEDDING_SIMILARITY_THRESHOLD,
             'use_llm_check': False,
         }
     )
@@ -520,89 +524,59 @@ class LightRAG:
         if self.embedding_func is None:
             raise ValueError('embedding_func must be provided before initializing storages')
 
-        # Initialize all storages
-        self.key_string_value_json_storage_cls: type[BaseKVStorage] = self._get_storage_class(self.kv_storage)  # type: ignore
-        self.vector_db_storage_cls: type[BaseVectorStorage] = self._get_storage_class(self.vector_storage)  # type: ignore
-        self.graph_storage_cls: type[BaseGraphStorage] = self._get_storage_class(self.graph_storage)  # type: ignore
-        self.key_string_value_json_storage_cls = partial(  # type: ignore
-            self.key_string_value_json_storage_cls, global_config=global_config
+        # Initialize all storages - cast from dynamic imports to expected types
+        self.key_string_value_json_storage_cls: type[BaseKVStorage] = cast(
+            type[BaseKVStorage], self._get_storage_class(self.kv_storage)
         )
-        self.vector_db_storage_cls = partial(  # type: ignore
-            self.vector_db_storage_cls, global_config=global_config
+        self.vector_db_storage_cls: type[BaseVectorStorage] = cast(
+            type[BaseVectorStorage], self._get_storage_class(self.vector_storage)
         )
-        self.graph_storage_cls = partial(  # type: ignore
-            self.graph_storage_cls, global_config=global_config
+        self.graph_storage_cls: type[BaseGraphStorage] = cast(
+            type[BaseGraphStorage], self._get_storage_class(self.graph_storage)
+        )
+        # Bind global_config to storage constructors
+        self.key_string_value_json_storage_cls = cast(
+            type[BaseKVStorage],
+            partial(self.key_string_value_json_storage_cls, global_config=global_config),
+        )
+        self.vector_db_storage_cls = cast(
+            type[BaseVectorStorage],
+            partial(self.vector_db_storage_cls, global_config=global_config),
+        )
+        self.graph_storage_cls = cast(
+            type[BaseGraphStorage],
+            partial(self.graph_storage_cls, global_config=global_config),
         )
 
         # Initialize document status storage
         self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
 
-        self.llm_response_cache: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
-            workspace=self.workspace,
-            global_config=global_config,
-            embedding_func=self.embedding_func,
+        # Initialize KV storages
+        self.llm_response_cache = self._create_kv_storage(NameSpace.KV_STORE_LLM_RESPONSE_CACHE)
+        self.text_chunks = self._create_kv_storage(NameSpace.KV_STORE_TEXT_CHUNKS)
+        self.full_docs = self._create_kv_storage(NameSpace.KV_STORE_FULL_DOCS)
+        self.full_entities = self._create_kv_storage(NameSpace.KV_STORE_FULL_ENTITIES)
+        self.full_relations = self._create_kv_storage(NameSpace.KV_STORE_FULL_RELATIONS)
+        self.entity_chunks = self._create_kv_storage(NameSpace.KV_STORE_ENTITY_CHUNKS)
+        self.relation_chunks = self._create_kv_storage(NameSpace.KV_STORE_RELATION_CHUNKS)
+
+        # Initialize graph storage
+        self.chunk_entity_relation_graph = self._create_graph_storage(
+            NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION
         )
 
-        self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
+        # Initialize vector storages
+        self.entities_vdb = self._create_vector_storage(
+            NameSpace.VECTOR_STORE_ENTITIES,
+            {'entity_name', 'source_id', 'content', 'file_path'},
         )
-
-        self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_FULL_DOCS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
+        self.relationships_vdb = self._create_vector_storage(
+            NameSpace.VECTOR_STORE_RELATIONSHIPS,
+            {'src_id', 'tgt_id', 'source_id', 'content', 'file_path'},
         )
-
-        self.full_entities: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_FULL_ENTITIES,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-        )
-
-        self.full_relations: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_FULL_RELATIONS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-        )
-
-        self.entity_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_ENTITY_CHUNKS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-        )
-
-        self.relation_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
-            namespace=NameSpace.KV_STORE_RELATION_CHUNKS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-        )
-
-        self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
-            namespace=NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-        )
-
-        self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=NameSpace.VECTOR_STORE_ENTITIES,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-            meta_fields={'entity_name', 'source_id', 'content', 'file_path'},
-        )
-        self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-            meta_fields={'src_id', 'tgt_id', 'source_id', 'content', 'file_path'},
-        )
-        self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
-            namespace=NameSpace.VECTOR_STORE_CHUNKS,
-            workspace=self.workspace,
-            embedding_func=self.embedding_func,
-            meta_fields={'full_doc_id', 'content', 'file_path'},
+        self.chunks_vdb = self._create_vector_storage(
+            NameSpace.VECTOR_STORE_CHUNKS,
+            {'full_doc_id', 'content', 'file_path'},
         )
 
         # Initialize document status storage
@@ -623,7 +597,7 @@ class LightRAG:
             queue_name='LLM func',
         )(
             partial(
-                self.llm_model_func,  # type: ignore
+                cast(Callable[..., Any], self.llm_model_func),
                 hashing_kv=hashing_kv,
                 **self.llm_model_kwargs,
             )
@@ -896,7 +870,7 @@ class LightRAG:
         if not need_entity_migration and not need_relation_migration:
             return
 
-        BATCH_SIZE = 500  # Process 500 records per batch
+        batch_size = DEFAULT_MIGRATION_BATCH_SIZE
 
         if need_entity_migration:
             try:
@@ -909,12 +883,12 @@ class LightRAG:
 
             # Process nodes in batches
             total_nodes = len(nodes)
-            total_batches = (total_nodes + BATCH_SIZE - 1) // BATCH_SIZE
+            total_batches = (total_nodes + batch_size - 1) // batch_size
             total_migrated = 0
 
             for batch_idx in range(total_batches):
-                start_idx = batch_idx * BATCH_SIZE
-                end_idx = min((batch_idx + 1) * BATCH_SIZE, total_nodes)
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, total_nodes)
                 batch_nodes = nodes[start_idx:end_idx]
 
                 upsert_payload: dict[str, dict[str, object]] = {}
@@ -956,12 +930,12 @@ class LightRAG:
 
             # Process edges in batches
             total_edges = len(edges)
-            total_batches = (total_edges + BATCH_SIZE - 1) // BATCH_SIZE
+            total_batches = (total_edges + batch_size - 1) // batch_size
             total_migrated = 0
 
             for batch_idx in range(total_batches):
-                start_idx = batch_idx * BATCH_SIZE
-                end_idx = min((batch_idx + 1) * BATCH_SIZE, total_edges)
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, total_edges)
                 batch_edges = edges[start_idx:end_idx]
 
                 upsert_payload: dict[str, dict[str, object]] = {}
@@ -1033,6 +1007,42 @@ class LightRAG:
         storage_class = lazy_external_import(import_path, storage_name)
         return storage_class
 
+    def _create_kv_storage(self, namespace: NameSpace) -> BaseKVStorage:
+        """Create a KV storage instance with common parameters."""
+        return cast(
+            BaseKVStorage,
+            self.key_string_value_json_storage_cls(
+                namespace=namespace,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+            ),
+        )
+
+    def _create_vector_storage(
+        self, namespace: NameSpace, meta_fields: set[str]
+    ) -> BaseVectorStorage:
+        """Create a vector storage instance with common parameters."""
+        return cast(
+            BaseVectorStorage,
+            self.vector_db_storage_cls(
+                namespace=namespace,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+                meta_fields=meta_fields,
+            ),
+        )
+
+    def _create_graph_storage(self, namespace: NameSpace) -> BaseGraphStorage:
+        """Create a graph storage instance with common parameters."""
+        return cast(
+            BaseGraphStorage,
+            self.graph_storage_cls(
+                namespace=namespace,
+                workspace=self.workspace,
+                embedding_func=self.embedding_func,
+            ),
+        )
+
     @staticmethod
     def _parse_entity_content(content: str) -> tuple[str, str]:
         """Parse entity content in 'type: description' format.
@@ -1049,6 +1059,7 @@ class LightRAG:
             return entity_type, description
         return 'Unknown', content
 
+    @sync_wrapper()
     def insert(
         self,
         input: str | list[str],
@@ -1058,32 +1069,7 @@ class LightRAG:
         file_paths: str | list[str] | None = None,
         track_id: str | None = None,
     ) -> str:
-        """Sync Insert documents with checkpoint support
-
-        Args:
-            input: Single document string or list of document strings
-            split_by_character: if split_by_character is not None, split the string by character, if chunk longer than
-            chunk_token_size, it will be split again by token size.
-            split_by_character_only: if split_by_character_only is True, split the string by character only, when
-            split_by_character is None, this parameter is ignored.
-            ids: single string of the document ID or list of unique document IDs, if not provided, MD5 hash IDs will be generated
-            file_paths: single string of the file path or list of file paths, used for citation
-            track_id: tracking ID for monitoring processing status, if not provided, will be generated
-
-        Returns:
-            str: tracking ID for monitoring processing status
-        """
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(
-            self.ainsert(
-                input,
-                split_by_character,
-                split_by_character_only,
-                ids,
-                file_paths,
-                track_id,
-            )
-        )
+        """Sync version of :meth:`ainsert`."""
 
     async def ainsert(
         self,
@@ -1463,8 +1449,8 @@ class LightRAG:
         """
 
         # Get pipeline status shared data and lock
-        pipeline_status = await get_namespace_data('pipeline_status', workspace=self.workspace)
-        pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=self.workspace)
+        pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=self.workspace)
+        pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=self.workspace)
 
         # Check if another process is already processing the queue
         async with pipeline_status_lock:
@@ -1671,14 +1657,16 @@ class LightRAG:
                                 )
 
                             # Build chunks dictionary
+                            # Cast after isinstance validation to help type checker
+                            validated_chunks = cast(list[dict[str, Any]], chunking_result)
                             chunks: dict[str, Any] = {
-                                compute_mdhash_id(dp['content'], prefix='chunk-'): {  # type: ignore[index]
+                                compute_mdhash_id(dp['content'], prefix='chunk-'): {
                                     **dp,
                                     'full_doc_id': doc_id,
                                     'file_path': file_path,  # Add file path to each chunk
                                     'llm_cache_list': [],  # Initialize empty LLM cache list for each chunk
                                 }
-                                for dp in chunking_result  # type: ignore[union-attr]
+                                for dp in validated_chunks
                             }
 
                             if not chunks:
@@ -2008,22 +1996,24 @@ class LightRAG:
             raise e
 
     async def _insert_done(self, pipeline_status=None, pipeline_status_lock=None) -> None:
+        # All storage instances implement StorageNameSpace protocol
+        all_storages: list[Any] = [
+            self.full_docs,
+            self.doc_status,
+            self.text_chunks,
+            self.full_entities,
+            self.full_relations,
+            self.entity_chunks,
+            self.relation_chunks,
+            self.llm_response_cache,
+            self.entities_vdb,
+            self.relationships_vdb,
+            self.chunks_vdb,
+            self.chunk_entity_relation_graph,
+        ]
         tasks = [
             cast(StorageNameSpace, storage_inst).index_done_callback()
-            for storage_inst in [  # type: ignore
-                self.full_docs,
-                self.doc_status,
-                self.text_chunks,
-                self.full_entities,
-                self.full_relations,
-                self.entity_chunks,
-                self.relation_chunks,
-                self.llm_response_cache,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-            ]
+            for storage_inst in all_storages
             if storage_inst is not None
         ]
         await asyncio.gather(*tasks)
@@ -2058,9 +2048,9 @@ class LightRAG:
             except Exception as e:
                 logger.warning(f'Auto orphan connection failed: {e}')
 
+    @sync_wrapper()
     def insert_custom_kg(self, custom_kg: dict[str, Any], full_doc_id: str | None = None) -> None:
-        loop = always_get_an_event_loop()
-        loop.run_until_complete(self.ainsert_custom_kg(custom_kg, full_doc_id))
+        """Sync version of :meth:`ainsert_custom_kg`."""
 
     async def ainsert_custom_kg(
         self,
@@ -2229,28 +2219,14 @@ class LightRAG:
             if update_storage:
                 await self._insert_done()
 
+    @sync_wrapper()
     def query(
         self,
         query: str,
         param: QueryParam | None = None,
         system_prompt: str | None = None,
     ) -> str | Iterator[str]:
-        """
-        Perform a sync query.
-
-        Args:
-            query (str): The query to be executed.
-            param (QueryParam): Configuration parameters for query execution.
-            prompt (Optional[str]): Custom prompts for fine-tuned control over the system's behavior. Defaults to None, which uses PROMPTS["rag_response"].
-
-        Returns:
-            str: The result of the query execution.
-        """
-        if param is None:
-            param = QueryParam()
-        loop = always_get_an_event_loop()
-
-        return loop.run_until_complete(self.aquery(query, param, system_prompt))  # type: ignore
+        """Sync version of :meth:`aquery`."""
 
     async def aquery(
         self,
@@ -2288,28 +2264,13 @@ class LightRAG:
         else:
             return llm_response.get('content', '')
 
+    @sync_wrapper()
     def query_data(
         self,
         query: str,
         param: QueryParam | None = None,
     ) -> dict[str, Any]:
-        """
-        Synchronous data retrieval API: returns structured retrieval results without LLM generation.
-
-        This function is the synchronous version of aquery_data, providing the same functionality
-        for users who prefer synchronous interfaces.
-
-        Args:
-            query: Query text for retrieval.
-            param: Query parameters controlling retrieval behavior (same as aquery).
-
-        Returns:
-            dict[str, Any]: Same structured data result as aquery_data.
-        """
-        if param is None:
-            param = QueryParam()
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.aquery_data(query, param))
+        """Sync version of :meth:`aquery_data`."""
 
     async def aquery_data(
         self,
@@ -2675,30 +2636,14 @@ class LightRAG:
                 },
             }
 
+    @sync_wrapper()
     def query_llm(
         self,
         query: str,
         param: QueryParam | None = None,
         system_prompt: str | None = None,
     ) -> dict[str, Any]:
-        """
-        Synchronous complete query API: returns structured retrieval results with LLM generation.
-
-        This function is the synchronous version of aquery_llm, providing the same functionality
-        for users who prefer synchronous interfaces.
-
-        Args:
-            query: Query text for retrieval and LLM generation.
-            param: Query parameters controlling retrieval and LLM behavior.
-            system_prompt: Optional custom system prompt for LLM generation.
-
-        Returns:
-            dict[str, Any]: Same complete response format as aquery_llm.
-        """
-        if param is None:
-            param = QueryParam()
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.aquery_llm(query, param, system_prompt))
+        """Sync version of :meth:`aquery_llm`."""
 
     async def _query_done(self):
         await self.llm_response_cache.index_done_callback()
@@ -2729,9 +2674,9 @@ class LightRAG:
         except Exception as e:
             logger.error(f'Error while clearing cache: {e}')
 
+    @sync_wrapper()
     def clear_cache(self) -> None:
-        """Synchronous version of aclear_cache."""
-        return always_get_an_event_loop().run_until_complete(self.aclear_cache())
+        """Sync version of :meth:`aclear_cache`."""
 
     async def get_docs_by_status(self, status: DocStatus) -> dict[str, DocProcessingStatus]:
         """Get documents by status
@@ -2837,8 +2782,8 @@ class LightRAG:
                 - `file_path` (str | None): The file path of the deleted document, if available.
         """
         # Get pipeline status shared data and lock for validation
-        pipeline_status = await get_namespace_data('pipeline_status', workspace=self.workspace)
-        pipeline_status_lock = get_namespace_lock('pipeline_status', workspace=self.workspace)
+        pipeline_status = await get_namespace_data(NS_PIPELINE_STATUS, workspace=self.workspace)
+        pipeline_status_lock = get_namespace_lock(NS_PIPELINE_STATUS, workspace=self.workspace)
 
         # Track whether WE acquired the pipeline
         we_acquired_pipeline = False
@@ -3444,17 +3389,9 @@ class LightRAG:
             entity_name,
         )
 
+    @sync_wrapper()
     def delete_by_entity(self, entity_name: str) -> DeletionResult:
-        """Synchronously delete an entity and all its relationships.
-
-        Args:
-            entity_name: Name of the entity to delete.
-
-        Returns:
-            DeletionResult: An object containing the outcome of the deletion process.
-        """
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.adelete_by_entity(entity_name))
+        """Sync version of :meth:`adelete_by_entity`."""
 
     async def adelete_by_relation(self, source_entity: str, target_entity: str) -> DeletionResult:
         """Asynchronously delete a relation between two entities.
@@ -3475,18 +3412,9 @@ class LightRAG:
             target_entity,
         )
 
+    @sync_wrapper()
     def delete_by_relation(self, source_entity: str, target_entity: str) -> DeletionResult:
-        """Synchronously delete a relation between two entities.
-
-        Args:
-            source_entity: Name of the source entity.
-            target_entity: Name of the target entity.
-
-        Returns:
-            DeletionResult: An object containing the outcome of the deletion process.
-        """
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.adelete_by_relation(source_entity, target_entity))
+        """Sync version of :meth:`adelete_by_relation`."""
 
     async def get_processing_status(self) -> dict[str, int]:
         """Get current document processing status counts
@@ -3569,6 +3497,7 @@ class LightRAG:
             self.relation_chunks,
         )
 
+    @sync_wrapper()
     def edit_entity(
         self,
         entity_name: str,
@@ -3576,8 +3505,7 @@ class LightRAG:
         allow_rename: bool = True,
         allow_merge: bool = False,
     ) -> dict[str, Any]:
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.aedit_entity(entity_name, updated_data, allow_rename, allow_merge))
+        """Sync version of :meth:`aedit_entity`."""
 
     async def aedit_relation(
         self, source_entity: str, target_entity: str, updated_data: dict[str, Any]
@@ -3607,9 +3535,9 @@ class LightRAG:
             self.relation_chunks,
         )
 
+    @sync_wrapper()
     def edit_relation(self, source_entity: str, target_entity: str, updated_data: dict[str, Any]) -> dict[str, Any]:
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.aedit_relation(source_entity, target_entity, updated_data))
+        """Sync version of :meth:`aedit_relation`."""
 
     async def acreate_entity(self, entity_name: str, entity_data: dict[str, Any]) -> dict[str, Any]:
         """Asynchronously create a new entity.
@@ -3633,9 +3561,9 @@ class LightRAG:
             entity_data,
         )
 
+    @sync_wrapper()
     def create_entity(self, entity_name: str, entity_data: dict[str, Any]) -> dict[str, Any]:
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.acreate_entity(entity_name, entity_data))
+        """Sync version of :meth:`acreate_entity`."""
 
     async def acreate_relation(
         self, source_entity: str, target_entity: str, relation_data: dict[str, Any]
@@ -3663,9 +3591,9 @@ class LightRAG:
             relation_data,
         )
 
+    @sync_wrapper()
     def create_relation(self, source_entity: str, target_entity: str, relation_data: dict[str, Any]) -> dict[str, Any]:
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.acreate_relation(source_entity, target_entity, relation_data))
+        """Sync version of :meth:`acreate_relation`."""
 
     async def amerge_entities(
         self,
@@ -3708,6 +3636,7 @@ class LightRAG:
             self.relation_chunks,
         )
 
+    @sync_wrapper()
     def merge_entities(
         self,
         source_entities: list[str],
@@ -3715,10 +3644,7 @@ class LightRAG:
         merge_strategy: dict[str, str] | None = None,
         target_entity_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(
-            self.amerge_entities(source_entities, target_entity, merge_strategy, target_entity_data)
-        )
+        """Sync version of :meth:`amerge_entities`."""
 
     async def aexport_data(
         self,
@@ -3749,31 +3675,14 @@ class LightRAG:
             include_vector_data,
         )
 
+    @sync_wrapper()
     def export_data(
         self,
         output_path: str,
         file_format: Literal['csv', 'excel', 'md', 'txt'] = 'csv',
         include_vector_data: bool = False,
     ) -> None:
-        """
-        Synchronously exports all entities, relations, and relationships to various formats.
-        Args:
-            output_path: The path to the output file (including extension).
-            file_format: Output format - "csv", "excel", "md", "txt".
-                - csv: Comma-separated values file
-                - excel: Microsoft Excel file with multiple sheets
-                - md: Markdown tables
-                - txt: Plain text formatted output
-                - table: Print formatted tables to console
-            include_vector_data: Whether to include data from the vector database.
-        """
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(self.aexport_data(output_path, file_format, include_vector_data))
+        """Sync version of :meth:`aexport_data`."""
 
     async def aconnect_orphan_entities(
         self,
@@ -3827,7 +3736,7 @@ class LightRAG:
             return result
 
         try:
-            from lightrag.kg.postgres_impl import SQL_TEMPLATES
+            from lightrag.kg.postgres_impl import SQL_TEMPLATES, VECTOR_DISTANCE_METRIC, VECTOR_DISTANCE_OP
 
             # Step 1: Get target entities (orphans or sparse entities based on max_degree)
             if target_max_degree == 0:
@@ -3852,24 +3761,36 @@ class LightRAG:
                 orphan_content = orphan.get('content', '')
                 orphan_vector = orphan.get('content_vector', '')
 
-                if not orphan_vector:
+                # Check for empty/missing vector - use len() to avoid numpy array boolean ambiguity
+                if orphan_vector is None or (hasattr(orphan_vector, '__len__') and len(orphan_vector) == 0):
                     result['errors'].append(f'No vector for orphan: {orphan_name}')
                     continue
 
                 # Step 3: Get candidate connections
                 # Choose query based on cross_connect setting
-                candidate_sql = (
+                candidate_sql_template = (
                     SQL_TEMPLATES['get_orphan_candidates']
                     if allow_cross_connect
                     else SQL_TEMPLATES['get_connected_candidates']
                 )
 
-                # Format vector for PostgreSQL
-                vector_str = orphan_vector if isinstance(orphan_vector, str) else str(list(orphan_vector))
+                # Format vector for PostgreSQL - comma-separated floats (SQL adds brackets)
+                if isinstance(orphan_vector, str):
+                    # Already a string, strip brackets if present
+                    vector_str = orphan_vector.strip('[]')
+                else:
+                    # Convert numpy/list to comma-separated string
+                    vector_str = ','.join(str(float(v)) for v in orphan_vector)
+
+                # Format SQL with vector embedded inline (asyncpg can't convert strings to pgvector)
+                candidate_sql = candidate_sql_template.format(
+                    vector_str=vector_str,
+                    distance_op=VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC],
+                )
 
                 candidates = await db.query(
                     candidate_sql,
-                    [workspace, vector_str, orphan_name, sim_threshold, max_candidates],
+                    [workspace, orphan_name, sim_threshold, max_candidates],
                     multirows=True,
                 )
 
@@ -3988,6 +3909,7 @@ class LightRAG:
 
         return result
 
+    @sync_wrapper()
     def connect_orphan_entities(
         self,
         max_candidates: int = 3,
@@ -3995,18 +3917,14 @@ class LightRAG:
         confidence_threshold: float | None = None,
         cross_connect: bool | None = None,
     ) -> dict[str, Any]:
-        """Synchronously connect orphan entities. See aconnect_orphan_entities for details."""
-        loop = always_get_an_event_loop()
-        return loop.run_until_complete(
-            self.aconnect_orphan_entities(max_candidates, similarity_threshold, confidence_threshold, cross_connect)
-        )
+        """Sync version of :meth:`aconnect_orphan_entities`."""
 
     async def _append_orphan_message(self, message: str):
         """Add a timestamped message to the orphan connection history."""
         from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 
-        orphan_status = await get_namespace_data('orphan_connection_status', workspace=self.workspace)
-        orphan_lock = get_namespace_lock('orphan_connection_status', workspace=self.workspace)
+        orphan_status = await get_namespace_data(NS_ORPHAN_CONNECTION_STATUS, workspace=self.workspace)
+        orphan_lock = get_namespace_lock(NS_ORPHAN_CONNECTION_STATUS, workspace=self.workspace)
 
         async with orphan_lock:
             timestamp = datetime.now().strftime('%H:%M:%S')
@@ -4042,8 +3960,8 @@ class LightRAG:
         """
         from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 
-        orphan_status = await get_namespace_data('orphan_connection_status', workspace=self.workspace)
-        orphan_lock = get_namespace_lock('orphan_connection_status', workspace=self.workspace)
+        orphan_status = await get_namespace_data(NS_ORPHAN_CONNECTION_STATUS, workspace=self.workspace)
+        orphan_lock = get_namespace_lock(NS_ORPHAN_CONNECTION_STATUS, workspace=self.workspace)
 
         # Check if already running
         async with orphan_lock:
@@ -4083,7 +4001,7 @@ class LightRAG:
                 result['errors'].append('Orphan connection requires PostgreSQL vector storage')
                 return result
 
-            from lightrag.kg.postgres_impl import SQL_TEMPLATES
+            from lightrag.kg.postgres_impl import SQL_TEMPLATES, VECTOR_DISTANCE_METRIC, VECTOR_DISTANCE_OP
 
             # Step 1: Get target entities (orphans or sparse entities based on max_degree)
             if max_degree == 0:
@@ -4125,7 +4043,8 @@ class LightRAG:
                 orphan_content = orphan.get('content', '')
                 orphan_vector = orphan.get('content_vector', '')
 
-                if not orphan_vector:
+                # Check for empty/missing vector - use len() to avoid numpy array boolean ambiguity
+                if orphan_vector is None or (hasattr(orphan_vector, '__len__') and len(orphan_vector) == 0):
                     result['errors'].append(f'No vector for orphan: {orphan_name}')
                     async with orphan_lock:
                         orphan_status['processed_orphans'] += 1
@@ -4138,16 +4057,29 @@ class LightRAG:
                     )
 
                 # Get candidate connections
-                candidate_sql = (
+                candidate_sql_template = (
                     SQL_TEMPLATES['get_orphan_candidates']
                     if allow_cross_connect
                     else SQL_TEMPLATES['get_connected_candidates']
                 )
-                vector_str = orphan_vector if isinstance(orphan_vector, str) else str(list(orphan_vector))
+
+                # Format vector for PostgreSQL - comma-separated floats (SQL adds brackets)
+                if isinstance(orphan_vector, str):
+                    # Already a string, strip brackets if present
+                    vector_str = orphan_vector.strip('[]')
+                else:
+                    # Convert numpy/list to comma-separated string
+                    vector_str = ','.join(str(float(v)) for v in orphan_vector)
+
+                # Format SQL with vector embedded inline (asyncpg can't convert strings to pgvector)
+                candidate_sql = candidate_sql_template.format(
+                    vector_str=vector_str,
+                    distance_op=VECTOR_DISTANCE_OP[VECTOR_DISTANCE_METRIC],
+                )
 
                 candidates = await db.query(
                     candidate_sql,
-                    [workspace, vector_str, orphan_name, sim_threshold, max_candidates],
+                    [workspace, orphan_name, sim_threshold, max_candidates],
                     multirows=True,
                 )
 

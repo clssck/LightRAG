@@ -1,9 +1,14 @@
 """
 Quick test for Entity Resolution feature.
 
-Tests that:
+Tests LLM-based entity resolution:
 1. "FDA" and "US Food and Drug Administration" resolve to the same entity
-2. "Dupixant" (typo) matches "Dupixent" via fuzzy matching
+2. Similar entities are deduplicated via LLM review
+
+The resolution flow:
+1. Cache check (instant, free)
+2. VDB similarity search for candidates
+3. LLM batch review for decisions
 """
 
 import asyncio
@@ -42,7 +47,7 @@ async def main():
     logger.setLevel(logging.DEBUG)
 
     print('\n' + '=' * 60)
-    print('Entity Resolution Test')
+    print('Entity Resolution Test (LLM-based)')
     print('=' * 60)
 
     rag = LightRAG(
@@ -51,9 +56,9 @@ async def main():
         llm_model_func=gpt_4o_mini_complete,
         entity_resolution_config=EntityResolutionConfig(
             enabled=True,
-            fuzzy_threshold=0.85,
-            vector_threshold=0.5,
-            max_candidates=3,
+            min_confidence=0.85,
+            candidates_per_entity=5,
+            batch_size=20,
         ),
     )
 

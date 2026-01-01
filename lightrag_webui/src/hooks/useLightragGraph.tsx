@@ -1,14 +1,8 @@
-import type Graph from 'graphology'
-import { UndirectedGraph } from 'graphology'
-import { useCallback, useEffect, useRef } from 'react'
-import { useTranslation } from 'react-i18next'
-import seedrandom from 'seedrandom'
-import { toast } from 'sonner'
 import {
-  type LightragEdgeType,
-  type LightragGraphType,
-  type LightragNodeType,
-  queryGraphs,
+    type LightragEdgeType,
+    type LightragGraphType,
+    type LightragNodeType,
+    queryGraphs,
 } from '@/api/lightrag'
 import * as Constants from '@/lib/constants'
 import { errorMessage } from '@/lib/utils'
@@ -16,6 +10,12 @@ import { type RawEdgeType, RawGraph, type RawNodeType, useGraphStore } from '@/s
 import { useSettingsStore } from '@/stores/settings'
 import { useBackendState } from '@/stores/state'
 import { DEFAULT_NODE_COLOR, resolveNodeColor } from '@/utils/graphColor'
+import type Graph from 'graphology'
+import { UndirectedGraph } from 'graphology'
+import { useCallback, useEffect, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
+import seedrandom from 'seedrandom'
+import { toast } from 'sonner'
 
 // Internal mutable types for graph processing
 // These extend API types with visualization properties added during data transformation
@@ -45,28 +45,30 @@ const getNodeColorByType = (nodeType: string | undefined): string => {
 }
 
 const validateGraph = (graph: RawGraph) => {
+  const debug = import.meta.env.DEV && localStorage.getItem('DEBUG_GRAPH')
+
   // Check if graph exists
   if (!graph) {
-    console.log('Graph validation failed: graph is null')
+    if (debug) console.log('Graph validation failed: graph is null')
     return false
   }
 
   // Check if nodes and edges are arrays
   if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
-    console.log('Graph validation failed: nodes or edges is not an array')
+    if (debug) console.log('Graph validation failed: nodes or edges is not an array')
     return false
   }
 
   // Check if nodes array is empty
   if (graph.nodes.length === 0) {
-    console.log('Graph validation failed: nodes array is empty')
+    if (debug) console.log('Graph validation failed: nodes array is empty')
     return false
   }
 
   // Validate each node
   for (const node of graph.nodes) {
     if (!node.id || !node.labels || !node.properties) {
-      console.log('Graph validation failed: invalid node structure')
+      if (debug) console.log('Graph validation failed: invalid node structure')
       return false
     }
   }
@@ -74,7 +76,7 @@ const validateGraph = (graph: RawGraph) => {
   // Validate each edge
   for (const edge of graph.edges) {
     if (!edge.id || !edge.source || !edge.target) {
-      console.log('Graph validation failed: invalid edge structure')
+      if (debug) console.log('Graph validation failed: invalid edge structure')
       return false
     }
   }
@@ -84,12 +86,11 @@ const validateGraph = (graph: RawGraph) => {
     const source = graph.getNode(edge.source)
     const target = graph.getNode(edge.target)
     if (source === undefined || target === undefined) {
-      console.log('Graph validation failed: edge references non-existent node')
+      if (debug) console.log('Graph validation failed: edge references non-existent node')
       return false
     }
   }
 
-  console.log('Graph validation passed')
   return true
 }
 
@@ -127,9 +128,12 @@ const fetchGraph = async (
   const queryLabel = label || '*'
 
   try {
-    console.log(
-      `Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}, minDegree: ${minDegree}, includeOrphans: ${includeOrphans}`
-    )
+    // Debug logging - only in development
+    if (import.meta.env.DEV && localStorage.getItem('DEBUG_GRAPH')) {
+      console.log(
+        `Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}, minDegree: ${minDegree}, includeOrphans: ${includeOrphans}`
+      )
+    }
     rawData = await queryGraphs(queryLabel, maxDepth, maxNodes, minDegree, includeOrphans)
   } catch (e) {
     useBackendState.getState().setErrorMessage(errorMessage(e), 'Query Graphs Error!')
@@ -213,9 +217,10 @@ const fetchGraph = async (
 
     if (!validateGraph(rawGraph)) {
       rawGraph = null
-      console.warn('Invalid graph data')
+      if (import.meta.env.DEV && localStorage.getItem('DEBUG_GRAPH')) {
+        console.warn('Invalid graph data')
+      }
     }
-    console.log('Graph data loaded')
   }
 
   // console.debug({ data: JSON.parse(JSON.stringify(rawData)) })
@@ -229,7 +234,6 @@ const createSigmaGraph = (rawGraph: RawGraph | null) => {
   const maxEdgeSize = useSettingsStore.getState().maxEdgeSize
   // Skip graph creation if no data or empty nodes
   if (!rawGraph || !rawGraph.nodes.length) {
-    console.log('No graph data available, skipping sigma graph creation')
     return null
   }
 
@@ -260,16 +264,38 @@ const createSigmaGraph = (rawGraph: RawGraph | null) => {
   }
 
   // Add edges from raw graph data
+  // Track added edges to handle bidirectional duplicates (API returns A->B and B->A)
+  const addedEdges = new Set<string>()
+
   for (const rawEdge of rawGraph?.edges ?? []) {
+    // Create canonical edge key (smaller id first) to detect duplicates
+    const edgeKey =
+      rawEdge.source < rawEdge.target
+        ? `${rawEdge.source}-${rawEdge.target}`
+        : `${rawEdge.target}-${rawEdge.source}`
+
+    // Skip if we've already added this edge (handles bidirectional duplicates)
+    if (addedEdges.has(edgeKey)) {
+      continue
+    }
+
     // Get weight from edge properties or default to 1
     const weight = rawEdge.properties?.weight !== undefined ? Number(rawEdge.properties.weight) : 1
 
-    rawEdge.dynamicId = graph.addEdge(rawEdge.source, rawEdge.target, {
-      label: rawEdge.properties?.keywords || undefined,
-      size: weight, // Set initial size based on weight
-      originalWeight: weight, // Store original weight for recalculation
-      type: 'curvedNoArrow', // Explicitly set edge type to no arrow
-    })
+    try {
+      rawEdge.dynamicId = graph.addEdge(rawEdge.source, rawEdge.target, {
+        label: rawEdge.properties?.keywords || undefined,
+        size: weight, // Set initial size based on weight
+        originalWeight: weight, // Store original weight for recalculation
+        type: 'curvedNoArrow', // Explicitly set edge type to no arrow
+      })
+      addedEdges.add(edgeKey)
+    } catch (e) {
+      // Silently skip duplicate edges - this is expected for bidirectional graph data
+      if (!(e instanceof Error) || !e.message.includes('already exists')) {
+        console.warn(`Failed to add edge ${rawEdge.source} -> ${rawEdge.target}:`, e)
+      }
+    }
   }
 
   // Calculate edge size based on weight range, similar to node size calculation
@@ -383,8 +409,6 @@ const useLightrangeGraph = () => {
         })
       }
 
-      console.log('Preparing graph data...')
-
       // Use a local copy of the parameters
       const currentQueryLabel = queryLabel
       const currentMaxQueryDepth = maxQueryDepth
@@ -409,7 +433,6 @@ const useLightrangeGraph = () => {
         )
       } else {
         // 2. If query label is empty, set data to null
-        console.log('Query label is empty, show empty graph')
         dataPromise = Promise.resolve({ rawGraph: null, is_truncated: false })
       }
 
@@ -470,13 +493,7 @@ const useLightrangeGraph = () => {
             // Only clear last successful query label if it's not an auth error
             if (!isAuthError) {
               state.setLastSuccessfulQueryLabel('')
-            } else {
-              console.log('Keep queryLabel for post-login reload')
             }
-
-            console.log(
-              `Graph data is empty, created graph with empty graph node. Auth error: ${isAuthError}`
-            )
           } else {
             // Create and set new graph
             const newSigmaGraph = createSigmaGraph(data)
@@ -770,14 +787,6 @@ const useLightrangeGraph = () => {
         seedrandom(Date.now().toString(), { global: true })
         const randomAngle = Math.random() * 2 * Math.PI
 
-        console.log('nodeSize:', nodeToExpand.size, 'nodesToAdd:', nodesToAdd.size)
-        console.log(
-          'cameraRatio:',
-          Math.round(cameraRatio * 100) / 100,
-          'spreadFactor:',
-          Math.round(spreadFactor * 100) / 100
-        )
-
         // Add new nodes
         for (const nodeId of nodesToAdd) {
           const newNode = processedNodes.find((n) => n.id === nodeId)
@@ -833,8 +842,16 @@ const useLightrangeGraph = () => {
           const newEdge = processedEdges.find((e) => e.id === edgeId)
           if (!newEdge) continue
 
-          // Skip if edge already exists
-          if (sigmaGraph.hasEdge(newEdge.source, newEdge.target)) {
+          // Skip if edge already exists (check both directions for undirected graph)
+          if (
+            sigmaGraph.hasEdge(newEdge.source, newEdge.target) ||
+            sigmaGraph.hasEdge(newEdge.target, newEdge.source)
+          ) {
+            // If edge exists, try to get existing id so we don't break things downstream
+            newEdge.dynamicId =
+              sigmaGraph.edge(newEdge.source, newEdge.target) ||
+              sigmaGraph.edge(newEdge.target, newEdge.source) ||
+              ''
             continue
           }
 
@@ -847,12 +864,20 @@ const useLightrangeGraph = () => {
           maxWeight = Math.max(maxWeight, weight)
 
           // Add the edge to the sigma graph
-          newEdge.dynamicId = sigmaGraph.addEdge(newEdge.source, newEdge.target, {
-            label: newEdge.properties?.keywords || undefined,
-            size: weight, // Set initial size based on weight
-            originalWeight: weight, // Store original weight for recalculation
-            type: 'curvedNoArrow', // Explicitly set edge type to no arrow
-          })
+          try {
+            newEdge.dynamicId = sigmaGraph.addEdge(newEdge.source, newEdge.target, {
+              label: newEdge.properties?.keywords || undefined,
+              size: weight, // Set initial size based on weight
+              originalWeight: weight, // Store original weight for recalculation
+              type: 'curvedNoArrow', // Explicitly set edge type to no arrow
+            })
+          } catch (e) {
+            // Silently skip duplicate edges
+            if (!(e instanceof Error) || !e.message.includes('already exists')) {
+              console.warn(`Failed to add edge ${newEdge.source} -> ${newEdge.target}:`, e)
+            }
+            newEdge.dynamicId = sigmaGraph.edge(newEdge.source, newEdge.target) || ''
+          }
 
           // Add the edge to the raw graph
           if (!rawGraph.getEdge(newEdge.id, false)) {
@@ -863,7 +888,7 @@ const useLightrangeGraph = () => {
             // Update dynamic edge map
             rawGraph.edgeDynamicIdMap[newEdge.dynamicId] = rawGraph.edges.length - 1
           } else {
-            console.error('Edge already exists in rawGraph:', newEdge.id)
+            // Edge already exists in rawGraph - this is expected for bidirectional data
           }
         }
 
@@ -1031,7 +1056,6 @@ const useLightrangeGraph = () => {
     }
 
     // If no graph exists yet, create a new one and store it
-    console.log('Creating new Sigma graph instance')
     const graph = new UndirectedGraph()
     useGraphStore.getState().setSigmaGraph(graph)
     return graph as Graph<NodeType, EdgeType>
